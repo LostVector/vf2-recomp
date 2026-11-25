@@ -8,6 +8,7 @@
 // Giles), with machine/gen_fifo.cpp (Olivier Galibert) for the two FIFOs between i960 and TGP.
 // The sound board's 68000 is MAME's (cpu/m68000, Olivier Galibert), on the board's bus.
 #include "model2a.h"
+#include "rom_pages.h"
 #include "../core/scheduler_gap.h"
 #include "../core/frame_clock.h"
 #include "parallel.h"
@@ -192,36 +193,77 @@ mb86233_device &model2a::tgp() { return m_tgp->cpu; }
 
 // ---------------------------------------------------------------------------------------------
 
+#if defined(__linux__)
+// Never discard allocator headers or adjoining allocations at the ends.
+static void discard_zero_rom_pages(std::span<const u8> region)
+{
+    const long system_page = sysconf(_SC_PAGESIZE);
+    if (system_page <= 0 || region.empty()) return;
+    const size_t page = size_t(system_page);
+    const uintptr_t address = reinterpret_cast<uintptr_t>(region.data());
+    const uintptr_t begin = (address + page - 1) & ~uintptr_t(page - 1);
+    const uintptr_t end = (address + region.size()) & ~uintptr_t(page - 1);
+    if (end <= begin) return;
+
+    const std::vector<u8> zero(page);
+    uintptr_t run = 0;
+    for (uintptr_t at = begin; at < end; at += page) {
+        if (!std::memcmp(reinterpret_cast<const void *>(at), zero.data(), page)) {
+            if (!run) run = at;
+        } else if (run) {
+            madvise(reinterpret_cast<void *>(run), at - run, MADV_DONTNEED);
+            run = 0;
+        }
+    }
+    if (run) madvise(reinterpret_cast<void *>(run), end - run, MADV_DONTNEED);
+}
+#endif
+
 void model2a::release_unused_roms()
 {
-	for (int id : {romset::COPRO_DATA, romset::OTHER_DATA, romset::VIDEO_UNK})
-		std::vector<u8>().swap(m_roms.regions[id]);
+    for (int id : {romset::COPRO_DATA, romset::OTHER_DATA, romset::VIDEO_UNK})
+        std::vector<u8>().swap(m_roms.regions[id]);
 #if defined(__linux__)
-	// VF2's 36 MiB data and 32 MiB polygon regions contain large zero-padded
-	// ranges. Keep their address/mirror semantics, but let Linux back untouched
-	// zero pages with its shared zero page rather than private physical RAM.
-	// Exclude allocator headers and any neighbouring allocation at both ends.
-	const size_t page=size_t(sysconf(_SC_PAGESIZE));
-	if (!page || (page & (page-1))) return;
-	std::vector<u8> zero(page,0);
-	for (auto &region : m_roms.regions) {
-		if(region.empty())continue;
-		uintptr_t begin=(reinterpret_cast<uintptr_t>(region.data())+page-1)&~uintptr_t(page-1);
-		uintptr_t end=(reinterpret_cast<uintptr_t>(region.data())+region.size())&~uintptr_t(page-1),run=0;
-		for(uintptr_t at=begin;at<end;at+=page){
-			if(!std::memcmp(reinterpret_cast<const void*>(at),zero.data(),page)){if(!run)run=at;}
-			else if(run){madvise(reinterpret_cast<void*>(run),at-run,MADV_DONTNEED);run=0;}
-		}
-		if(run)madvise(reinterpret_cast<void*>(run),end-run,MADV_DONTNEED);
-	}
+    for (const auto &region : m_roms.regions) discard_zero_rom_pages(region);
 #endif
 }
 
-model2a::model2a(romset::result &&roms, bool recompile)
+struct model2a::compact_roms {
+    rom_page_mapping data, polygons, textures;
+};
+
+model2a::model2a(romset::result &&roms, bool recompile, bool compact_rom)
 	: m_roms(std::move(roms)), m_rom(m_roms.regions[romset::MAINCPU]), m_data(m_roms.regions[romset::MAIN_DATA]),
+	  m_texture_rom(m_roms.regions[romset::TEXTURES]),
 	  m_cpu(*this)
 {
 	for (const std::vector<u8> &r : m_roms.regions) m_rom_hash = m_rom_hash * 0x100000001B3ull ^ m2::state_hash(r.data(), r.size());
+    std::span<const u8> poly = m_roms.regions[romset::POLYGONS];
+#if defined(__linux__)
+    if (compact_rom) {
+        // Reclaim zero padding ahead of staging the new backing so peak
+        // physical usage stays bounded. The original hash remains the save
+        // state identifier. Publish the new views before wiring any readers.
+        for (int id : {romset::MAIN_DATA, romset::POLYGONS, romset::TEXTURES})
+            discard_zero_rom_pages(m_roms.regions[id]);
+        m_compact_roms = std::make_unique<compact_roms>();
+        const auto compact = [&](romset::region_id id, rom_page_mapping &mapping) -> std::span<u8> {
+            auto &region = m_roms.regions[id];
+            if (const size_t saved = mapping.compact(region)) {
+                std::fprintf(stderr, "ROM compact %s: %zu KiB of duplicate pages shared\n",
+                             romset::region_name(id), saved / 1024);
+                std::vector<u8>().swap(region);
+                return mapping.bytes();
+            }
+            return region;
+        };
+        m_data = compact(romset::MAIN_DATA, m_compact_roms->data);
+        poly = compact(romset::POLYGONS, m_compact_roms->polygons);
+        m_texture_rom = compact(romset::TEXTURES, m_compact_roms->textures);
+    }
+#else
+    (void)compact_rom;
+#endif
 	m_tgp = std::make_unique<tgp_bus>(*this);
 	m_ram200.assign(0x40000, 0);
 	m_workram.assign(0x100000, 0);
@@ -241,9 +283,9 @@ model2a::model2a(romset::result &&roms, bool recompile)
 	for (int i = 0; i < 256; i++)
 		m_gamma[i] = u8(std::max((double(i) - 64.0) * 255.0 / 191.0, 0.0));
 	m_pens.fill(0xff000000);   // rgb_t::black(), until the game writes them
-	const auto &tex = m_roms.regions[romset::TEXTURES], &poly = m_roms.regions[romset::POLYGONS];
 	m_video = std::make_unique<model2_video>(reinterpret_cast<u32 *>(m_bufferram.data()), m_tex0.data(), m_tex1.data(),
-		m_lumaram.data(), m_palram.data(), m_colorxlat.data(), m_gamma, tex.data(), tex.size(), poly.data(), poly.size());
+		m_lumaram.data(), m_palram.data(), m_colorxlat.data(), m_gamma,
+		m_texture_rom.data(), m_texture_rom.size(), poly.data(), poly.size());
 	m_video->m_fbvramA = m_fbvram_a.data();
 	m_video->m_fbvramB = m_fbvram_b.data();
 	resize_screen();
@@ -511,7 +553,7 @@ void model2a::fight_cheats(int infinite, bool one_hit, bool no_time, int ring, i
 // 0x201e0bd printed by 0x8918: spaces.
 int model2a::hide_free_play_text()
 {
-	auto &d = m_roms.regions[romset::MAIN_DATA];
+	auto d = m_data;
 	// (each checked with what's around it: the image's whole record; the string with the credit
 	// texts before it, 0x201e09c-0x201e0c5)
 	if (!m_free_play_text.empty()) return 2;   // (hidden already)
@@ -529,7 +571,7 @@ int model2a::hide_free_play_text()
 
 void model2a::show_free_play_text()
 {
-	auto &d = m_roms.regions[romset::MAIN_DATA];
+	auto d = m_data;
 	for (const auto &[at, bytes] : m_free_play_text) memcpy(&d[at], bytes.data(), bytes.size());
 	m_free_play_text.clear();
 }
@@ -3670,7 +3712,7 @@ void model2a::freecam_fighters()
 {
 	constexpr u32 RECORDS = 0x0200620c, MODELS = 0x020e0004;   // (random_fighter.cpp's: the fighters' records, the models' table)
 	auto rd = [&](u32 a) -> u32 {
-		const std::vector<u8> &r = a >= 0x02000000 ? m_roms.regions[romset::MAIN_DATA] : m_roms.regions[romset::MAINCPU];
+		const std::span<const u8> r = a >= 0x02000000 ? std::span<const u8>(m_data) : std::span<const u8>(m_rom);
 		const u32 o = a >= 0x02000000 ? a - 0x02000000 : a;
 		if (size_t(o) + 4 > r.size()) return 0;
 		u32 v; memcpy(&v, &r[o], 4); return v;

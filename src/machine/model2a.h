@@ -28,6 +28,7 @@
 #include "scsp.h"
 #include "state_io.h"
 #include "word_fifo.h"
+#include <span>
 #include "../../third_party/mame/m68000/m68000.h"
 #include "hud_names.h"
 #include <array>
@@ -50,7 +51,7 @@ public:
 	static constexpr uint64_t VBLANK_CYCLES = CYCLES_PER_LINE * (LINES - VBLANK_LINE);
 	static constexpr int WIDTH = 496, HEIGHT = 384;
 
-	explicit model2a(romset::result &&roms, bool recompile = true);   // (recompile false: a sound board alone, set_sound_only, never runs the i960)
+	explicit model2a(romset::result &&roms, bool recompile = true, bool compact_rom = false);   // (recompile false: a sound board alone, set_sound_only, never runs the i960)
 	~model2a() override;
 
 	void reset();
@@ -540,7 +541,10 @@ private:
 	void setup_pages();
 
 	romset::result m_roms;
-	const std::vector<u8> &m_rom, &m_data;
+	const std::vector<u8> &m_rom;
+	struct compact_roms;
+	std::unique_ptr<compact_roms> m_compact_roms;
+	std::span<u8> m_data, m_texture_rom;
 	i960_device m_cpu;
 	std::unique_ptr<i960rec::runtime> m_rec;
 	i960rec::native_stats m_native_stats;

@@ -180,6 +180,11 @@ The uploaded ROM ZIP and checkpoint file are released after decoding to
 avoid keeping duplicate copies in initramfs. `release_unused_roms()` also
 releases unused auxiliary regions and decommits zero-filled ROM pages on
 Linux, preserving the padded regions' virtual addresses and byte values.
+On Linux, the Mini frontend also shares byte-identical nonzero pages in
+main data, polygons and textures. Guest addresses and the original ROM
+hash stay the same, and ROM patches use private copy-on-write pages.
+Set `VF2_ROM_DEDUP=0` to use the original allocations for a comparison.
+The loader falls back to those allocations if RAM backing is unavailable.
 The kernel reserves 64 MiB as CMA; Mali allocations can still fail with
 apparently free CMA pages, so bounded submission and memory measurements
 remain necessary.

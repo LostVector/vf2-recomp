@@ -86,6 +86,29 @@ for pc,word in enumerate(words):
         sequence = ','.join(f'0x{opcode:08x}u' for opcode in words[pc:private_regions[0xdca]])
         handler = f'private_4a_resume_entry<0x{pc:03x},{sequence}>'
     lines.append(f'    {{0x{word:08x}u,&{handler}}},')
+# Daytona command 0x36 has bus-visible setup and stores between the
+# private arithmetic spans. Keep both the exact image and the boundaries
+# explicit. The repeated external load keeps an ordinary read per step.
+daytona_image = hashlib.sha256(data).hexdigest() == (
+    'f819e4bf81eaf21b6ba6b44f40ff3415fd04bc7c9057bb91c77d3a196d7fd27c'
+)
+if daytona_image:
+    command36_regions = (
+        (0x458, 0x45c), (0x45d, 0x46c), (0x470, 0x473),
+        (0x479, 0x47c), (0x47d, 0x480), (0x483, 0x489),
+        (0x48a, 0x48e), (0x490, 0x4a4), (0x49a, 0x4a4),
+        (0x4a8, 0x4b4), (0x4b6, 0x4b9), (0x4bd, 0x4c0),
+        (0x4e9, 0x4ee), (0x50d, 0x510),
+    )
+    continuation = ' ' + chr(92)
+    lines.extend([
+        '#if defined(MODEL2_ORIGINAL)',
+        '#define DAYTONA_TGP_COMMAND36_REGIONS(REGION, REPEAT)' + continuation,
+    ])
+    for first, end in command36_regions:
+        opcodes = ','.join(f'0x{word:08x}u' for word in words[first:end])
+        lines.append(f'    REGION(0x{first:03x},{opcodes})' + continuation)
+    lines += [f'    REPEAT(0x48f,0x{words[0x48f]:08x}u)', '#endif']
 lines.extend(['};','return entries;',''])
 out.write_text('\n'.join(lines));print(f'{len(set(words))} distinct instruction handlers, {len(words)} guarded program entries -> {out}')
 blocks=out.with_name('vf2_tgp_blocks.inc')

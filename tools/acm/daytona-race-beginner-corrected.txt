@@ -1,0 +1,25 @@
+at 350
+press coin1 8
+at 380
+press start1 8
+at 420
+press accelerator 12
+at 510
+press accelerator 12
+at 690
+hold accelerator
+
+at 1580
+press steerleft 24
+
+at 1810
+press steerleft 30
+
+at 1890
+press steerleft 40
+
+at 2025
+press steerleft 36
+
+at 2110
+press steerleft 35

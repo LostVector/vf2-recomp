@@ -1,0 +1,31 @@
+# Cold boot into Three Seven Speedway with automatic transmission.
+at 350
+press coin1 8
+at 380
+press start1 8
+at 420
+press accelerator 12
+at 510
+press accelerator 12
+at 690
+hold accelerator
+at 1060
+press steerleft 26
+at 1200
+press steerright 26
+at 1350
+press brake 12
+at 2240
+press brake 20
+at 2500
+press steerleft 12
+at 2660
+press steerright 12
+at 2950
+press steerleft 12
+at 3230
+press steerright 18
+at 3450
+press brake 20
+at 3590
+press view2 8

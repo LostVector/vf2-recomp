@@ -23,6 +23,7 @@
 #include "../host/romset.h"
 #include "mame_lite.h"
 #include "s24tile.h"
+#include <span>
 #include "model2_video.h"
 #include "parallel.h"
 #include "scsp.h"
@@ -71,6 +72,9 @@ public:
 	// restores one this build saved, and false (the board then half restored: reset it) if it isn't one.
 	// Between frames only (after run_frame()).
 	void save_state(std::vector<uint8_t> &out, std::vector<m2::StateSection> *sections = nullptr);
+	// Same bytes as save_state, written straight to the file: the Mini cannot
+	// hold the 7 MB core buffer beside the render caches. Returns bytes written.
+	bool save_state_file(m2::FileStateWriter &w, size_t &core_bytes);
 	bool load_state(const uint8_t *p, size_t n);
 	size_t fixed_state_size() const;   // (the memories' part, and its header: a state's least)
 	static constexpr uint32_t STATE_MAGIC = 0x53324656, STATE_VERSION = 1;   // "VF2S"
@@ -82,6 +86,7 @@ public:
 	// Host nanoseconds spent in the sound board's two parts (probe only, VF2_SOUND_PROFILE):
 	// the 68000's timeslices inside the scheduler, and the SCSP's sample update.
 	uint64_t sound_68k_ns() const { return m_sound_68k_ns; }
+	uint64_t sound_68k_runs() const { return m_sound_68k_runs; }
 	uint64_t sound_scsp_ns() const { return m_sound_scsp_ns; }
 	uint64_t sound_scsp_updates() const { return m_sound_scsp_updates; }
 	int sound_peak() const { return m_sound_peak; }
@@ -255,6 +260,9 @@ public:
 	// Drawing the polygons at every vblank, as MAME does (off: faster, for runs without pictures)
 	void set_draw_3d(bool on) { m_draw_3d = on; }
 	uint64_t frame_number() const { return m_frame_number; }
+	// Development diagnostics for checkpoint comparisons.
+	u32 geo_write_start() const { return m_geo_write_start; }
+	u32 geo_read_start() const { return m_video->m_geo_read_start_address; }
 	// The i960's time in its cycles (MAME's totalcycles for it), and the TGP's in its.
 	uint64_t now() const;
 	uint64_t tgp_now() const;
@@ -283,6 +291,14 @@ public:
 	// Linux also discards private physical pages containing only zero ROM
 	// padding; their addresses and zero contents remain available on demand.
 	void release_unused_roms();
+	// Reports each retained ROM region's address range and how much of it is
+	// physically resident (mincore), so a large anonymous VMA in /proc/maps can
+	// be attributed to a region and its real RAM cost measured. No-op off Linux.
+	void rom_residency_report() const;
+	// Hand the sound board's regions to another machine (the detached worker).
+	// They are the only regions a held board never reads. Called after the
+	// constructor has hashed the full set, so checkpoint headers still match.
+	romset::result take_sound_regions();
 	const segas24_tile &tiles() const { return m_tiles; }
 	// Online play's names under the energy bars (hud_names.h), in the 2D picture only, and their flags: "" none
 	void set_hud_names(const std::string names[2], const m2hud::Flag *flags[2] = nullptr)
@@ -461,11 +477,24 @@ public:
 
 	// Inputs, active low as on the cabinet (IN0: coins, service, start; IN1/IN2: players)
 	u8 m_in0 = 0xff, m_in1 = 0xff, m_in2 = 0xff, m_sw = 0xff;
+#ifdef MODEL2_ORIGINAL
+	void configure_standalone_cabinet();
+	bool configure_twin_display_curve();
+	// Port B uses m_in0, port C uses m_in1. The three ADC inputs are
+	// steering, accelerator and brake in cabinet units.
+	std::array<u8, 3> m_driving_analog{0x80, 0x20, 0x20};
+	u8 m_driving_gear = 0;
+#endif
 	bool m_debug_mode = false;   // (set_debug_mode: not in the saved state, a setting)
 
 	// The sound board's output since the host last took it: stereo pairs at SOUND_RATE (the
 	// SCSP's 22.5792 MHz / 512). Empty while the board is held (set_sound(false)).
 	static constexpr int SOUND_RATE = 44100;
+#ifdef MODEL2_ORIGINAL
+	static constexpr uint32_t SOUND_CPU_CLOCK = 10000000;
+#else
+	static constexpr uint32_t SOUND_CPU_CLOCK = 45158400 / 4;
+#endif
 	std::vector<int16_t> m_audio_out;
 	// The sound board running (68000, SCSP, the link both ways), or held halted as in the MAME
 	// reference runs for the CPU/video regression (the default). Takes effect at reset().
@@ -476,7 +505,20 @@ public:
 	// never do), and the bytes for the sound board come from sound_bytes, a MIDI byte's time apart (320 us), as
 	// the UART would send them. From the next reset() (with set_sound(true)).
 	void set_sound_only(bool on) { m_sound_only = on; }
+	// Timing probe for the detached worker: keep the board's schedule and the
+	// SCSP running but skip the 68000's execution, so the main loop's cost can
+	// be attributed to the interpreter's activity rather than to the thread.
+	void set_throttle_68k(bool on) { m_throttle_68k = on; }
+	// Probe companion: stop the SCSP producing samples too, so the worker thread exists but does no work.
+	void set_starve_scsp(bool on) { m_starve_scsp = on; }
 	void sound_bytes(const uint8_t *b, size_t n);
+    struct timed_midi_byte {
+        uint64_t offset_attoseconds;
+        uint8_t value;
+        bool operator==(const timed_midi_byte &) const = default;
+    };
+    void run_frame_capturing_midi(std::vector<timed_midi_byte> &events);
+    bool run_sound_frame(std::span<const timed_midi_byte> events);
 	size_t sound_bytes_waiting() const { return m_snd_queue.size(); }
 	// The link to the sound board a byte at a time (for the host): each byte the UART sends reaches
 	// the sound board's MIDI input when its stop bit would be read there, and the UART's status
@@ -529,6 +571,7 @@ private:
 	// (Cheats' random fighters in a save state, while they're on: the ROM's bytes they change as a match goes, and what
 	// they know of them; a load puts back the fighters the state had, made again if they're others now)
 	void random_state(m2::StateWriter &io);
+	void random_state(m2::FileStateWriter &io);
 	void random_state(m2::StateReader &io);
 	enum { P_TILE, P_CHAR, P_PAL, P_XLAT, P_FB_A, P_FB_B, P_TEX0, P_TEX1, P_LUMA, PAGED };
 	static constexpr size_t PAGE = 4096;
@@ -545,6 +588,14 @@ private:
 	struct compact_roms;
 	std::unique_ptr<compact_roms> m_compact_roms;
 	std::span<u8> m_data, m_texture_rom;
+	// MAIN_DATA mirror geometry (from romset::result). Reads of a byte in
+	// [m_mirror_base, m_mirror_end) fold to the source block so the mirror
+	// physical pages can be discarded; 0 size means no mirrors (VF2).
+	u32 m_mirror_base = 0, m_mirror_size = 0, m_mirror_end = 0;
+	size_t fold_data(size_t x) const {
+		return (m_mirror_size && x >= m_mirror_base && x < m_mirror_end)
+			? m_mirror_base + ((x - m_mirror_base) & (m_mirror_size - 1)) : x;
+	}
 	i960_device m_cpu;
 	std::unique_ptr<i960rec::runtime> m_rec;
 	i960rec::native_stats m_native_stats;
@@ -686,6 +737,8 @@ private:
 	std::unique_ptr<model2_video> m_video;
 	bool m_sound_on = false;
 	bool m_sound_only = false;
+	bool m_throttle_68k = false;
+	bool m_starve_scsp = false;
 	std::deque<uint8_t> m_snd_queue;   // (sound_only: the bytes to go to the sound board)
 	atime m_snd_next = 0;              // (and when the next may)
 	void snd_link_byte();              // (T_UART on a sound board alone: the next of them in)
@@ -822,6 +875,10 @@ private:
 		void execute(uint64_t now);
 		void execute_write(uint64_t now);
 	} m_eeprom;
+#ifdef MODEL2_ORIGINAL
+	struct original_io_board;
+	std::unique_ptr<original_io_board> m_original_io;
+#endif
 	u8 io_read(int offset);
 	void io_write(int offset, u8 data);
 	void eeprom_w(u8 data);
@@ -843,6 +900,7 @@ private:
 	} m_uart;
 	void uart_write(int offset, u8 data);
 	void uart_start_tx();
+	void receive_sound_byte(u8 data);
 	void uart_clock_tick();
 	void uart_transmit_clock();
 	void uart_tx_ready_changed();
@@ -865,6 +923,10 @@ private:
 	std::unique_ptr<scsp_device> m_scsp;
 	struct snd_bus;
 	std::unique_ptr<snd_bus> m_snd_bus;
+#ifdef MODEL2_ORIGINAL
+	struct original_sound_board;
+	std::unique_ptr<original_sound_board> m_original_sound;
+#endif
 	std::unique_ptr<m68000_device> m_68k;
 	void sound_reset();
 	void sound_update_tick();
@@ -896,7 +958,7 @@ private:
 	void unmapped(u32 a, bool write);
 	bool m_modular_frame=false;
     uint64_t m_modular_frames=0;
-	uint64_t m_sound_68k_ns=0,m_sound_scsp_ns=0,m_sound_scsp_updates=0;
+	uint64_t m_sound_68k_ns=0,m_sound_scsp_ns=0,m_sound_scsp_updates=0,m_sound_68k_runs=0;
 	int m_sound_peak=0;
 	void milestone(const std::string &s) { if (on_milestone) on_milestone(s); }
     static void collapse_i960_timer_poll(void *context,u32 limit,u32 &counter,int &budget);

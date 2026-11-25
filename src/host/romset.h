@@ -18,7 +18,8 @@ enum region_id {
 	COPRO_TABLES,   // TGP sin/cos, atan, 1/x, 1/sqrt tables (opr-14742a/14743a), 0x40000
 	OTHER_DATA,     // 1/x and 1/sqrt(x) tables (opr-14744..14747), 0x80000
 	VIDEO_UNK,      // Model 2A video board tables (mpr-16310..16312), 0x200000
-	N_REGIONS
+	N_REGIONS,
+	IOCPU = N_REGIONS, // original Model 2 I/O firmware is separate from the VF2 regions
 };
 
 const char *region_name(int r);
@@ -37,9 +38,17 @@ struct result
 	bool ok = false;
 	std::string error;                  // what's missing or wrong, for the player
 	std::vector<uint8_t> regions[N_REGIONS];
+	std::vector<uint8_t> io_firmware;
 	std::vector<rom_status> roms;       // the checklist, one line per ROM
+	// A region whose bytes are one source block replicated at page-aligned
+	// mirrors. The bus and JIT fold reads in [mirror_base, mirror_end) back to
+	// [mirror_base, mirror_base+mirror_size), so the mirror physical pages can
+	// be discarded after the region is hashed. mirror_size 0: no mirrors.
+	int mirror_region = -1;
+	uint32_t mirror_base = 0, mirror_size = 0, mirror_end = 0;
 };
 
 result load(const std::string &zip);
+result load_daytona(const std::string &zip);
 
 } // namespace romset

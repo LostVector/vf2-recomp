@@ -2467,12 +2467,13 @@ logs and inventory are under `build/acm/retained-mesh-trial`.
 
 ### Bilinear display scaling
 
-Pass `--linear-upscale` with `benchmark-device.py --fast` to smooth the
-final canvas. The frontend also accepts `VF2_LINEAR_UPSCALE=1` in the
-environment when canvas rendering is enabled. This changes only magnification
-at presentation. The 496 ? 384 game canvas and the 480 ? 640 centered viewport
-keep their dimensions. Nearest-neighbor remains the preset for comparisons
-with earlier captures.
+Bilinear magnification of the final canvas is now the engine default, so no
+flag is needed. `--linear-upscale` is retained as an explicit no-op for old
+scripts; use `--nearest-upscale` to force nearest-neighbor magnification for
+pixel comparisons. The frontend's override is likewise `VF2_NEAREST_UPSCALE=1`;
+`VF2_LINEAR_UPSCALE` is obsolete. This changes only magnification at
+presentation. The 496 ? 384 game canvas and the 480 ? 640 centered viewport
+keep their dimensions.
 
 The 600-frame hardware comparison was 38.55 fps with bilinear and 39.51 fps
 with nearest-neighbor on the same ARM executable. Core and geometry state
@@ -4738,7 +4739,7 @@ Use `tools/scripts/benchmark_versus_fight.txt` with an arena checkpoint
 to exercise both fighters with movement, attacks and guards.
 
 ```sh
-python tools/acm/benchmark-device.py --fast --pgo-core --linear-upscale \
+python tools/acm/benchmark-device.py --fast --pgo-core \
     --frames 600 --paced --frame-trace --profile-packet-phases \
     --state build/acm/arena-checkpoints/stage-10.checkpoint \
     --input-script tools/scripts/benchmark_versus_fight.txt

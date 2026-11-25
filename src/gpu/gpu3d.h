@@ -80,7 +80,7 @@ struct gpu3d_frame
 {
     // Native GLES2 composition hooks, called while the target framebuffer is
     // bound. Underlay preserves its colour beneath 3D; overlay runs afterward.
-    bool (*underlay)(void *)=nullptr;
+    bool (*underlay)(void *, bool clear_depth)=nullptr;
     bool (*overlay)(void *)=nullptr;
     void *layers=nullptr;
     const gpu3d_geometry_frame *mesh_scene=nullptr;

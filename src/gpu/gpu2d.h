@@ -52,7 +52,8 @@ public:
     // all inputs needed by upload(), so the board may advance between them.
     virtual bool stage(const gpu2d_frame &frame)=0;
     virtual bool upload()=0;
-    virtual bool paint(unsigned pass,uintptr_t target,bool flip_y,bool clear)=0;
+    // Clear depth together with color only when the caller owns a depth attachment.
+    virtual bool paint(unsigned pass,uintptr_t target,bool flip_y,bool clear,bool clear_depth=false)=0;
     // RGBA texture, row zero at v=0 as with the host's CPU layer uploads.
     virtual uintptr_t target_handle(unsigned pass)const=0;
 };

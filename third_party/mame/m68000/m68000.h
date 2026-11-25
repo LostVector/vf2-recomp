@@ -43,6 +43,8 @@ public:
 	u32 pc() const { return m_ipc; }
 	u16 sr() const { return m_sr; }
 	u32 reg(int n) const { return m_da[n]; }   // D0-D7, A0-A6, USP, SSP
+	// Only the verified Daytona sound board provides this private RAM.
+	void set_daytona_voice_ram(const u16 *ram) { m_daytona_voice_ram = ram; }
 
 	virtual u32 execute_min_cycles() const noexcept override { return 1; }
 	virtual u32 execute_max_cycles() const noexcept override { return 158; }
@@ -913,6 +915,8 @@ protected:
 	inline void sr_xnzvc_u() {
 		m_sr = (m_sr & ~(SR_X|SR_N|SR_V|SR_C) & (m_isr | ~SR_Z)) | (m_isr & (SR_X|SR_N|SR_V|SR_C));
 	}
+private:
+	const u16 *m_daytona_voice_ram = nullptr;
 };
 
 #endif

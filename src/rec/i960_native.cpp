@@ -137,8 +137,33 @@ struct gen
     const bool direct_branches=std::getenv("VF2_REC_DIRECT_BRANCHES")!=nullptr;
     const bool predecoded_bursts=std::getenv("VF2_REC_PREDECODED_BURSTS")!=nullptr;
     const bool bus_address=std::getenv("VF2_REC_BUS_ADDRESS")!=nullptr;
+    const bool rotated_page_guard=std::getenv("VF2_REC_ROTATED_PAGE_GUARD")!=nullptr;
+    const bool fixed_scalars=[](){
+        const char *flag=std::getenv("DAYTONA_I960_FIXED_SCALARS");
+        return flag&&flag[0]=='1'&&flag[1]=='\0';
+    }();
     const bool port_stores=std::getenv("VF2_REC_PORT_STORES")!=nullptr;
 
+    // The page view and its backing storage are stable for as long as the
+    // generated code can run. Device and dirty-tracked write pages stay unmapped.
+    const uint8_t *fixed_scalar_pointer(const decoded &d,int size,bool write) const {
+        if(!fixed_scalars)return nullptr;
+        uint32_t address;
+        if(!(d.op&0x1000)){
+            if(d.op&0x2000)return nullptr;
+            address=d.op&0xfff;
+        }else{
+            const unsigned mode=(d.op>>10)&15;
+            if(mode==5)address=uint32_t(d.disp)+d.addr+8;
+            else if(mode==12)address=d.disp;
+            else return nullptr;
+        }
+        if((address&(size-1))||address>=(runtime::PAGES<<12))return nullptr;
+        const auto &pages=write?rt.wpage:rt.rpage;
+        const unsigned page_index=address>>12;
+        if(page_index>=pages.size()||!pages[page_index])return nullptr;
+        return pages[page_index]+(address&0xfff);
+    }
     bool is_hot_port_store(const decoded &d) const {
         // VF2 sets g10/g11 to the geometry/coprocessor windows and g12
         // to the FIFO offset before these routines. The address still comes
@@ -276,11 +301,22 @@ struct gen
 	// below the pages' limit, aligned to `align`
 	void page(uint8_t *const *table, int align, std::vector<sljit_jump *> &slow)
 	{
-		if (align > 1) {
-			sljit_emit_op2u(C_, SLJIT_AND32 | SLJIT_SET_Z, SLJIT_R1, 0, SLJIT_IMM, align - 1);
-			slow.push_back(sljit_emit_jump(C_, SLJIT_NOT_ZERO));
+		constexpr uint32_t limit = runtime::PAGES << 12;
+		if (rotated_page_guard && (align == 2 || align == 4)) {
+			// Move any misalignment into the high bits before testing the range.
+			// R1 preserves the original effective address for the bus fallback.
+			const int shift = align == 4 ? 2 : 1;
+			sljit_emit_op2(C_, SLJIT_ROTR32, SLJIT_R0, 0, SLJIT_R1, 0, SLJIT_IMM, shift);
+			slow.push_back(sljit_emit_cmp(C_, SLJIT_GREATER_EQUAL | SLJIT_32,
+				SLJIT_R0, 0, SLJIT_IMM, sljit_sw(limit >> shift)));
+		} else {
+			if (align > 1) {
+				sljit_emit_op2u(C_, SLJIT_AND32 | SLJIT_SET_Z, SLJIT_R1, 0, SLJIT_IMM, align - 1);
+				slow.push_back(sljit_emit_jump(C_, SLJIT_NOT_ZERO));
+			}
+			slow.push_back(sljit_emit_cmp(C_, SLJIT_GREATER_EQUAL | SLJIT_32,
+				SLJIT_R1, 0, SLJIT_IMM, sljit_sw(limit)));
 		}
-		slow.push_back(sljit_emit_cmp(C_, SLJIT_GREATER_EQUAL | SLJIT_32, SLJIT_R1, 0, SLJIT_IMM, sljit_sw(runtime::PAGES << 12)));
 		sljit_emit_op2(C_, SLJIT_LSHR32, SLJIT_R3, 0, SLJIT_R1, 0, SLJIT_IMM, 12);
 		sljit_emit_op1(C_, SLJIT_MOV, SLJIT_R2, 0, SLJIT_IMM, sljit_sw(table));
 		sljit_emit_op1(C_, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM2(SLJIT_R2, SLJIT_R3), SLJIT_WORD_SHIFT);
@@ -517,6 +553,14 @@ struct gen
 				return true;
 			case 0x8: case 0xc: case 0xe: case 0xb: {   // shro, shlo, shli, shri: t1 >= 32 as MAME has it
 				ic_sub(1);
+                if(fixed_scalars&&(op&0x800)){
+                    src2(SLJIT_R1,op);
+                    const unsigned amount=op&31;
+                    const sljit_s32 operation=sub==0x8?SLJIT_LSHR32:sub==0xb?SLJIT_ASHR32:SLJIT_SHL32;
+                    if(amount)sljit_emit_op2(C_,operation,SLJIT_R1,0,SLJIT_R1,0,SLJIT_IMM,amount);
+                    st_r(dst,SLJIT_R1);
+                    return true;
+                }
 				src1(SLJIT_R0, op); src2(SLJIT_R1, op);
 				sljit_jump *big = sljit_emit_cmp(C_, SLJIT_GREATER_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_IMM, 32);
 				sljit_emit_op2(C_, sub == 0x8 ? SLJIT_LSHR32 : sub == 0xb ? SLJIT_ASHR32 : SLJIT_SHL32, SLJIT_R1, 0, SLJIT_R1, 0, SLJIT_R0, 0);
@@ -578,11 +622,17 @@ struct gen
 		case 0x80: case 0xc0: case 0x88: case 0xc8: case 0x90: {   // ldob ldib ldos ldis ld
 			if (!memb_mode_ok(op)) return false;
 			const int size = o == 0x90 ? 4 : (o == 0x88 || o == 0xc8) ? 2 : 1;
+            const sljit_s32 mv = size == 4 ? SLJIT_MOV_U32 : o == 0x80 ? SLJIT_MOV_U8 : o == 0xc0 ? SLJIT_MOV_S8 : o == 0x88 ? SLJIT_MOV_U16 : SLJIT_MOV_S16;
+            if(const auto *pointer=fixed_scalar_pointer(d,size,false)){
+                ic_sub(4);
+                sljit_emit_op1(C_,mv,SLJIT_R0,0,SLJIT_MEM0(),reinterpret_cast<sljit_sw>(pointer));
+                st_r(dst,SLJIT_R0);
+                return true;
+            }
 			std::vector<sljit_jump *> slow;
 			if (!ea(d)) return false;
 			page(rpage, size, slow);
 			ic_sub(4);
-			const sljit_s32 mv = size == 4 ? SLJIT_MOV_U32 : o == 0x80 ? SLJIT_MOV_U8 : o == 0xc0 ? SLJIT_MOV_S8 : o == 0x88 ? SLJIT_MOV_U16 : SLJIT_MOV_S16;
 			sljit_emit_op1(C_, mv, SLJIT_R0, 0, SLJIT_MEM2(SLJIT_R2, SLJIT_R3), 0);
 			st_r(dst, SLJIT_R0);
 			sljit_jump *done = sljit_emit_jump(C_, SLJIT_JUMP);
@@ -618,6 +668,13 @@ struct gen
 		case 0x82: case 0xc2: case 0x8a: case 0xca: case 0x92: {   // stob stib stos stis st
 			if (!memb_mode_ok(op)) return false;
 			const int size = o == 0x92 ? 4 : (o == 0x8a || o == 0xca) ? 2 : 1;
+            if(const auto *pointer=fixed_scalar_pointer(d,size,true)){
+                ic_sub(2);
+                ld_r(SLJIT_R0,dst);
+                const sljit_s32 mv=size==4?SLJIT_MOV32:size==2?SLJIT_MOV_U16:SLJIT_MOV_U8;
+                sljit_emit_op1(C_,mv,SLJIT_MEM0(),reinterpret_cast<sljit_sw>(pointer),SLJIT_R0,0);
+                return true;
+            }
 			if (!ea(d)) return false;
 			if (bus_address && port_stores && is_hot_port_store(d)) {
 				ld_r(SLJIT_R2,dst);

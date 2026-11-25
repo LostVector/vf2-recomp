@@ -1,0 +1,21 @@
+# Expert, automatic transmission, from a cold cabinet.
+# Hold right through the confirm to select the third course.
+# With the 256 us DSP quantum, tick 2160 shows moving bridge traffic.
+
+at 350
+press coin1 8
+at 380
+press start1 8
+at 410
+hold steerright
+at 424
+press accelerator 12
+at 430
+release steerright
+at 510
+press accelerator 12
+at 690
+hold accelerator
+
+at 1740
+press steerleft 6

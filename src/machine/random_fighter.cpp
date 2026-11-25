@@ -427,7 +427,7 @@ public:
 	u32 seed_for(int pl);
 	u32 random_named();
 	// save states (model2a::random_state): the ROM's bytes they change as a match goes, and what they know
-	void save(m2::StateWriter &io);
+	template<class IO> void save(IO &io);
 	void load(m2::StateReader &io);
 };
 
@@ -2104,7 +2104,7 @@ struct random_host_state {   // (u32s only: no padding in a state)
 };
 }
 
-void random_fighters::save(m2::StateWriter &io)
+template<class IO> void random_fighters::save(IO &io)
 {
 	u32 tag = STATE_TAG;
 	io.pod(tag);
@@ -2167,4 +2167,5 @@ void random_fighters::load(m2::StateReader &io)
 }
 
 void model2a::random_state(m2::StateWriter &io) { m_random->save(io); }
+void model2a::random_state(m2::FileStateWriter &io) { m_random->save(io); }
 void model2a::random_state(m2::StateReader &io) { m_random->load(io); }

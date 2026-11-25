@@ -70,7 +70,7 @@ class gpu3d_geometry_frame {
     struct vertex {float x,y,z,u,v;};
     std::vector<gpu3d_poly> prepared;
     std::vector<size_t> order;
-    std::vector<uint64_t> sort_keys;
+    std::vector<uint64_t> sort_keys, radix_keys;
     using hair_lookup=uint32_t (*)(uint16_t,int);
     struct camera_tables {
         std::array<uint16_t,0x2000> palette;
@@ -289,7 +289,7 @@ public:
         if(!shared_compact||shared_compact->polygons.size()>32767||!mesh_polygons.empty()||
            std::getenv("VF2_REFERENCE_CAMERA_SORT"))return false;
         const auto &records=shared_compact->polygons;
-        sort_camera_indices(records);
+        sort_projected_camera_indices(records);
         out.polygons.resize(order.size());
         const int count=int(order.size());
         const int lanes=std::max(1,std::min(count,row_pool::get().threads()*4));
@@ -419,5 +419,52 @@ private:
             out.push_back(prepared[i]);
             if(track_mesh)mesh_projected_sources.push_back(mesh_source(i));
         }
+    }
+
+    template<class Polygons>
+    void sort_projected_camera_indices(const Polygons &input) {
+        static const bool enabled = std::getenv("DAYTONA_CAMERA_RADIX_SORT") != nullptr;
+        // Keep small lists on the comparison sort while qualifying the crossover.
+        if (!enabled || input.size() < 128) {
+            sort_camera_indices(input);
+            return;
+        }
+
+        std::array<std::array<uint32_t, 256>, 3> offsets{};
+        sort_keys.clear();
+        sort_keys.reserve(input.size());
+        // Stable passes preserve newest-first for ties by starting in reverse input order.
+        for (size_t i = input.size(); i-- > 0;) {
+            const auto &polygon = input[i];
+            if (polygon.window > final_window) continue;
+            const unsigned window = UINT8_MAX - polygon.window;
+            const unsigned depth = polygon.depth;
+            sort_keys.push_back((uint64_t(window) << 32) | (uint64_t(depth) << 16) |
+                uint16_t(UINT16_MAX - i));
+            ++offsets[0][depth & 255];
+            ++offsets[1][depth >> 8];
+            ++offsets[2][window];
+        }
+        radix_keys.resize(sort_keys.size());
+        auto *source = &sort_keys;
+        auto *target = &radix_keys;
+        for (unsigned pass = 0; pass < offsets.size(); ++pass) {
+            auto &positions = offsets[pass];
+            if (std::find(positions.begin(), positions.end(), sort_keys.size()) != positions.end())
+                continue;
+            uint32_t at = 0;
+            for (auto &position : positions) {
+                const uint32_t count = position;
+                position = at;
+                at += count;
+            }
+            const unsigned shift = 16 + pass * 8;
+            for (uint64_t key : *source)
+                (*target)[positions[(key >> shift) & 255]++] = key;
+            std::swap(source, target);
+        }
+        order.resize(source->size());
+        for (size_t i = 0; i < source->size(); ++i)
+            order[i] = UINT16_MAX - uint16_t((*source)[i]);
     }
 };

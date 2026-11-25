@@ -60,7 +60,7 @@ $(SLJIT_OBJ): third_party/sljit/sljitLir.c
 
 $(OBJ)/%.o: %.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(BOARD_CPPFLAGS) -MMD -MP -c $< -o $@
 
 # The renderer's float arithmetic: clang on Apple silicon fuses a * b + c into one rounding (fused
 # multiply-add), as MAME built there does (the reference pictures); x86-64 builds can't without
@@ -338,6 +338,34 @@ $(BIN)/gpu3dcmp-gles2: $(OBJ)/tools/gpu3dcmp-gles2.o $(call objs,src/host/stb_im
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS) -lEGL -lGLESv2
 
 ACM_LIBS ?= -lEGL -lGLESv2 -lasound
+.PHONY: daytona-acm daytona-acm-tgp daytona-tgp-dump
+daytona-acm daytona-acm-tgp daytona-tgp-dump:
+	$(MAKE) OBJ=$(OBJ)-daytona MODEL2_ORIGINAL=1 $(BIN)/$@
+
+ifeq ($(MODEL2_ORIGINAL),1)
+BOARD_CPPFLAGS = -DMODEL2_ORIGINAL
+MODEL1_AUDIO = third_party/model1-multipcm/multipcm.cpp third_party/ymfm/ymfm_opn.cpp third_party/ymfm/ymfm_adpcm.cpp third_party/ymfm/ymfm_ssg.cpp
+DAYTONA_FRONTEND = src/host/acm_main.cpp src/host/stb_image_impl.cpp $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000) $(MODEL1_AUDIO) src/gpu/gpu3d_gles2.cpp src/gpu/gpu2d_gles2.cpp
+DAYTONA_FRONTEND_OBJS = $(call objs,$(DAYTONA_FRONTEND))
+DAYTONA_TGP_GEN ?= build/daytona/gen
+
+$(OBJ)/src/core/mb86233_daytona_aot.o: src/core/mb86233_aot.cpp $(addprefix $(DAYTONA_TGP_GEN)/,vf2_tgp.inc vf2_tgp_blocks.inc vf2_tgp_matrix_timing.inc)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(BOARD_CPPFLAGS) -I$(DAYTONA_TGP_GEN) -ffp-contract=off -MMD -MP -c $< -o $@
+
+$(BIN)/daytona-acm: $(DAYTONA_FRONTEND_OBJS) $(SLJIT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS) $(ACM_LIBS)
+
+$(BIN)/daytona-acm-tgp: $(subst $(OBJ)/src/core/mb86233.o,$(OBJ)/src/core/mb86233_daytona_aot.o,$(DAYTONA_FRONTEND_OBJS)) $(SLJIT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS) $(ACM_LIBS)
+
+$(BIN)/daytona-tgp-dump: $(call objs,tools/acm/checkpoint.cpp $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000) $(MODEL1_AUDIO)) $(SLJIT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
+endif
+
 $(BIN)/vf2checkpoint: $(call objs,tools/acm/checkpoint.cpp $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000)) $(SLJIT_OBJ)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)

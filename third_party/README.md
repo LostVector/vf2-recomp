@@ -13,5 +13,8 @@
   Japanese and Korean letters with the kinsoku rules (ElementText's BuildToken).
 - `stb/`: Sean Barrett's stb_image 2.30 (public domain / MIT, see the end of the file), for loading the
   widescreen's painted sides (PNG, JPG).
+- `chips/`: Andre Weissflog's [Z80 core](chips/README.md), used by the Daytona I/O board.
+- `model1-multipcm/`: the standalone [MultiPCM implementation](model1-multipcm/README.md), used by the Daytona sound board.
+- `ymfm/`: Aaron Giles's [YM3438 implementation](ymfm/README.md), also used by the Daytona sound board.
 
 The menu's typeface, Barlow Condensed, is in assets/fonts (SIL Open Font License 1.1, assets/fonts/OFL.txt).

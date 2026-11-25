@@ -9,7 +9,9 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <zlib.h>
 #include <deque>
 #include <string>
 #include <type_traits>
@@ -59,6 +61,49 @@ public:
 private:
 	std::vector<uint8_t> &out;
 	std::vector<StateSection> *sections;
+};
+
+// The same field list written straight to a file. The Mini's memory limit
+// cannot hold the 7 MB core beside the render caches, so development
+// checkpoints stream instead of building a buffer (the bytes are identical).
+class FileStateWriter
+{
+public:
+	explicit FileStateWriter(FILE *f) : f(f) {}
+	static constexpr bool loading = false;
+	size_t count = 0;
+	uint32_t crc = 0;
+	bool failed = false;
+	void section(const char *) {}
+	void bytes(const void *p, size_t n)
+	{
+		if (n && fwrite(p, 1, n, f) != n) failed = true;
+		if (n) crc = ::crc32(crc, reinterpret_cast<const Bytef *>(p), uInt(n));
+		count += n;
+	}
+	template <class T> void pod(T &v)
+	{
+		static_assert(std::has_unique_object_representations_v<T>);
+		bytes(&v, sizeof(T));
+	}
+	template <class T> void vec(std::vector<T> &v)
+	{
+		static_assert(std::has_unique_object_representations_v<T>);
+		uint64_t n = v.size();
+		pod(n);
+		bytes(v.data(), n * sizeof(T));
+	}
+	template <class T> void deq(std::deque<T> &d)
+	{
+		static_assert(std::has_unique_object_representations_v<T>);
+		uint64_t n = d.size();
+		pod(n);
+		for (T &v : d) bytes(&v, sizeof(T));
+	}
+	bool check(bool) { return true; }
+
+private:
+	FILE *f;
 };
 
 class StateReader

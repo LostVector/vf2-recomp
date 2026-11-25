@@ -5,7 +5,7 @@ attribute vec2 aPosition;
 attribute vec3 aQ;
 attribute vec4 aTransformA,aTransformB;
 uniform vec2 uSize;
-uniform float uScale;
+uniform vec2 uScale;
 uniform highp float uSortDepth;
 uniform highp vec4 uTexture;
 varying VF2_VARY_PREC vec2 vUV0,vUV1;

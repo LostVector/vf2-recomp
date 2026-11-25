@@ -7,10 +7,20 @@
 #include <iomanip>
 #include <string_view>
 int main(int argc,char **argv){
+#ifdef MODEL2_ORIGINAL
+    if(argc!=5||std::string_view(argv[1])!="dump-tgp"){
+        std::fprintf(stderr,"usage: daytona-tgp-dump dump-tgp daytona.zip checkpoint output.bin\n");return 2;
+    }
+#endif
     if(argc<4){std::fprintf(stderr,"usage: vf2checkpoint create|verify vf2.zip checkpoint [frame script [versus-stage]]\n");return 2;}
     bool create=std::string(argv[1])=="create",dump=std::string(argv[1])=="dump-tgp";
     if(!create&&!dump&&std::string(argv[1])!="verify")return 2;
-    auto roms=romset::load(argv[2]);if(!roms.ok){std::fprintf(stderr,"%s\n",roms.error.c_str());return 1;}
+#ifdef MODEL2_ORIGINAL
+    auto roms=romset::load_daytona(argv[2]);
+#else
+    auto roms=romset::load(argv[2]);
+#endif
+    if(!roms.ok){std::fprintf(stderr,"%s\n",roms.error.c_str());return 1;}
     model2a m(std::move(roms));m.release_unused_roms();m.set_byte_link(true);m.set_sound(false);m.reset();m.defer_3d(true);
     std::string error,path=argv[3];
     if(create){

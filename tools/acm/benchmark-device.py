@@ -12,6 +12,8 @@ p.add_argument('--packed-tile-map',action=argparse.BooleanOptionalAction,default
 p.add_argument('--profile-geometry',action='store_true',help='Sample only the owned geometry worker CPU clock')
 p.add_argument('--profile-simulation',action='store_true',help='Sample only the simulation thread CPU clock')
 p.add_argument('--frame-trace',action='store_true',help='Archive simulation, EGL submission and pacing times for each tick')
+p.add_argument('--env',action='append',default=[],help='Extra KEY=VALUE for the device command, repeatable')
+p.add_argument('--save-state-out',type=pathlib.Path,default=None,help='Ask the run to save a checkpoint at its last frame and download it here')
 p.add_argument('--rotate-tile-maps',action=argparse.BooleanOptionalAction,default=None,help='Alternate packed quadrant tile textures')
 p.add_argument('--rotate-3d-palette',action=argparse.BooleanOptionalAction,default=None,help='Alternate wide 3D palette textures')
 p.add_argument('--trace-upload-stalls',action='store_true',help='Record uploads and slow renderer submission phases')
@@ -31,6 +33,16 @@ p.add_argument('--skip-inert-handoffs',action=argparse.BooleanOptionalAction,def
 p.add_argument('--trained-dsp-bundle',action=argparse.BooleanOptionalAction,default=None,help='Use the trained geometry DSP fast paths (default in compatible --fast gameplay)')
 p.add_argument("--cached-dsp-entry",action="store_true",help="Reuse verified state at a mapped DSP slice boundary")
 p.add_argument("--packed-dsp-handlers",action="store_true",help="Use the compact handler-pointer table for validated DSP code")
+p.add_argument('--sound-probe',choices=('off','muted','speaker'),help='Compare audio in a finite cold-boot snapshot render run')
+p.add_argument('--detached-audio',choices=('muted','speaker'),help='Run the sound board on an independent worker')
+p.add_argument('--sound-cpu',type=int,choices=range(4),help='Pin the detached sound worker to one CPU')
+p.add_argument('--sound-prio',type=int,help='Run the detached sound worker at this SCHED_FIFO priority')
+p.add_argument('--sound-throttle',help='Starvation probe: skip the detached 68000 on N of every M ticks, as N/M')
+p.add_argument('--sound-share',action='store_true',help='Let the main process share the detached sound worker\'s core')
+p.add_argument('--sound-scsp-starve',action='store_true',help='Probe: stop the detached SCSP producing samples too')
+p.add_argument('--sound-pcs',action='store_true',help='Histogram the detached 68000 instruction addresses (probe)')
+p.add_argument('--native-sound-effects',action='store_true',help='Use the native SCSP effects experiment')
+p.add_argument('--serial-simulation',action='store_true',help='Keep snapshot rendering and run simulation on the render thread')
 p.add_argument('--paced',action='store_true',help='Pace a finite run at the arcade rate')
 p.add_argument('--boot',action='store_true',help='Start from a cold game reset instead of the fight checkpoint')
 p.add_argument('--atlas-state-plan',type=pathlib.Path,help='Use a custom signed preload plan for a cold game reset')
@@ -132,7 +144,8 @@ p.add_argument('--reference-division',action='store_true')
 p.add_argument('--reference-duration',action='store_true',help='Use full-width scheduler cycle multiplications')
 p.add_argument('--reference-timers',action='store_true')
 p.add_argument('--lazy-aux-clocks',action=argparse.BooleanOptionalAction,default=None,help='Frame-boundary advancement for the halted sound CPU (default with --fast)')
-p.add_argument('--linear-upscale',action='store_true',help='Smooth the final composed canvas with bilinear magnification')
+p.add_argument('--linear-upscale',action='store_true',help='Bilinear magnification is the engine default; kept as an explicit no-op for old scripts')
+p.add_argument('--nearest-upscale',action='store_true',help='Force nearest-neighbour magnification of the final composed canvas (pixel-comparison arm)')
 p.add_argument('--swap-interval',type=int,choices=(0,1),help='Request EGL presentation interval explicitly')
 p.add_argument('--reference-packet-math',action='store_true',help='Use libm for repeated quantized texture packet math')
 p.add_argument('--reference-geometry-push',action='store_true',help='Dispatch geometry raster commands one word at a time')
@@ -164,6 +177,9 @@ p.add_argument('--atomic-row-claims',action=argparse.BooleanOptionalAction,defau
 p.add_argument('--direct-task-ranges',action=argparse.BooleanOptionalAction,default=None,help='Pass unit task ranges without dividing the row count')
 p.add_argument('--render-threads',type=int,choices=range(1,5),help='Total CPU threads preparing render packets')
 p.add_argument('--sim-cpu',type=int,choices=range(4),help='Pin simulation and exclude its core from rendering')
+p.add_argument('--sim-share',action='store_true',help='Keep the simulation core in the render set (rely on --sim-prio)')
+p.add_argument('--sim-prio',type=int,help='Run the simulation thread SCHED_FIFO at this priority')
+p.add_argument('--clock-trace',action='store_true',help='Sample DDR and CPU clocks at each monitor poll (clocks.csv)')
 p.add_argument('--full-texture-snapshot',action='store_true',help='Reference whole-bank texture snapshot copies')
 p.add_argument('--slow-tgp-ram',action='store_true')
 p.add_argument('--pgo-core',action=argparse.BooleanOptionalAction,default=None,help='Prefer the source-verified PGO core with --fast; --binary overrides this selection')
@@ -292,6 +308,12 @@ if a.trained_dsp_bundle:
     a.tgp_fused_command_intake=True
     a.tgp_command32_regions=True
     a.tgp_native_command37=True
+if a.native_sound_effects and not a.detached_audio and a.sound_probe not in ('muted','speaker'):
+    p.error('--native-sound-effects requires a running sound board')
+if (a.sound_probe or a.serial_simulation) and (not a.boot or not a.fast or a.interactive or a.mode!='full'):
+    p.error('Audio diagnostics require a finite --fast --boot run')
+if a.detached_audio and (a.interactive or a.mode != 'full'):
+    p.error('Detached audio requires a finite full run')
 assert 0<a.frames<=100000
 assert not a.tgp_native_io or a.tgp_native_jit, '--tgp-native-io requires --tgp-native-jit'
 assert not a.tgp_vfp_cache or a.tgp_native_jit, '--tgp-vfp-cache requires --tgp-native-jit'
@@ -323,8 +345,8 @@ if a.shared_camera and (a.mode!='full' or not a.camera_packets or not a.compact_
     p.error('--shared-camera requires compact camera packets without the mesh diagnostics')
 if a.reference_camera_sort and (a.mode!='full' or not a.camera_packets or not a.direct_projection):
     p.error('--reference-camera-sort requires direct camera projection')
-if a.linear_upscale and (not a.canvas or a.mode=='simulation'):
-    p.error('--linear-upscale requires canvas rendering')
+if (a.linear_upscale or a.nearest_upscale) and (not a.canvas or a.mode=='simulation'):
+    p.error('upscaling flags require canvas rendering')
 if a.mesh_render and (not a.fast or a.mode!='full' or not a.camera_packets or not a.compact_camera or not a.compact_packets or not a.indexed or not a.direct_pack or a.check_direct_pack):
     p.error('--mesh-render requires the indexed compact direct-pack full-render preset')
 if a.mesh_handoff and (a.mode!='full' or not a.camera_packets or not a.compact_camera):
@@ -421,6 +443,19 @@ try:
     state_arg='' if a.boot else '--load-state /run/vf2/fight.checkpoint '
     report_every=600 if a.interactive and not a.profile else min(60,a.frames)
     command=f'/run/vf2/run-game --release-rom --release-state {"" if a.sound_board else "--no-sound-board "}{"--mute " if a.audio_mute else ""}{state_arg}--report-every {report_every}'
+    if a.detached_audio:command+=f' --detached-audio {a.detached_audio}'
+    if a.sound_cpu is not None:command=f'VF2_SOUND_CPU={a.sound_cpu} '+command
+    if a.sound_prio is not None:command=f'VF2_SOUND_PRIO={a.sound_prio} '+command
+    if a.sound_throttle:command=f'VF2_SOUND_THROTTLE={a.sound_throttle} '+command
+    if a.sound_share:command='VF2_SOUND_CPU_SHARE=1 '+command
+    if a.sim_cpu is not None:command=f'VF2_SIM_CPU={a.sim_cpu} '+command
+    if a.sim_share:command='VF2_SIM_CPU_SHARE=1 '+command
+    if a.sim_prio is not None:command=f'VF2_SIM_PRIO={a.sim_prio} '+command
+    if a.sound_scsp_starve:command='VF2_SOUND_SCSP_STARVE=1 '+command
+    if a.sound_pcs:command=f'VF2_68K_PCS=1 '+command
+    if a.sound_probe:command='VF2_AUDIO_PROBE=1 '+command
+    if a.native_sound_effects:command='VF2_SCSP_NATIVE_EFFECTS=1 '+command
+    if a.serial_simulation:command='VF2_SERIAL_SIMULATION=1 '+command
     if a.input_script:command+=' --script /run/vf2/input-script.txt'
     if a.mode!='full':command+=' --'+('simulation-only' if a.mode=='simulation' else 'graphics-only')
     if a.draw_cadence:command+=f' --draw-cadence {a.draw_cadence}'
@@ -428,6 +463,8 @@ try:
         if not a.paced:command+=' --uncapped'
         command+=f' --frames {a.frames}'
         if a.mode!='simulation':command+=f' --capture {stem}.png'
+    save_stem=stem+'.save'
+    if a.save_state_out:command+=' --save-state '+save_stem
     if a.mesh_render:command='VF2_MESH_RENDER=1 VF2_GLES_STATS=1 '+command
     if a.mesh_handoff:command='VF2_MESH_HANDOFF=1 '+command
     if a.atlas_layout:command=f'VF2_ATLAS_LAYOUT={stem}.atlas VF2_GLES_STATS=1 '+command
@@ -450,6 +487,7 @@ try:
     if a.cached_dsp_entry:command="VF2_TGP_CACHED_ENTRY=1 "+command
     if a.packed_dsp_handlers:command="VF2_TGP_PACKED_HANDLERS=1 "+command
     if a.frame_trace:command=f'VF2_FRAME_TRACE={stem}.frames '+command
+    if a.env:command=' '.join(a.env)+' '+command
     if a.profile_simulation_windows or a.profile_render_windows:command='VF2_CPU_SAMPLE_WINDOWS=1 '+command
     if a.cell_index_transforms:command='VF2_CELL_INDEX_TRANSFORMS=1 '+command
     if a.retained_fan_cell_bounds:command='VF2_RETAINED_FAN_CELL_BOUNDS=1 '+command
@@ -551,7 +589,8 @@ try:
     if a.gpu_line_scroll and a.gpu_line_scroll_opaque_only:command='VF2_GPU_LINE_SCROLL_OPAQUE_ONLY=1 '+command
     if a.gpu_line_scroll:command='VF2_GPU_LINE_SCROLL=1 '+command
     if a.clip_empty_tiles:command='VF2_CLIP_EMPTY_TILES=1 '+command
-    if a.linear_upscale:command='VF2_LINEAR_UPSCALE=1 '+command
+    # Bilinear is the engine default; only the nearest arm needs an override.
+    if a.nearest_upscale:command='VF2_NEAREST_UPSCALE=1 '+command
     if a.swap_interval is not None:command=f'VF2_SWAP_INTERVAL={a.swap_interval} '+command
     if a.reference_packet_math:command='VF2_REFERENCE_PACKET_MATH=1 '+command
     if a.reference_geometry_push:command='VF2_REFERENCE_GEOMETRY_PUSH=1 '+command
@@ -583,6 +622,8 @@ try:
     if a.direct_task_ranges:command='VF2_DIRECT_TASK_RANGES=1 '+command
     if a.render_threads:command=f'VF2_THREADS={a.render_threads} '+command
     if a.sim_cpu is not None:command=f'VF2_SIM_CPU={a.sim_cpu} '+command
+    if a.sim_share:command='VF2_SIM_CPU_SHARE=1 '+command
+    if a.sim_prio is not None:command=f'VF2_SIM_PRIO={a.sim_prio} '+command
     if a.full_texture_snapshot:command='VF2_FULL_TEXTURE_SNAPSHOT=1 '+command
     if a.slow_tgp_ram:command='VF2_TGP_SLOW_RAM=1 '+command
     if a.tgp_interpreter:command='VF2_TGP_INTERP=1 '+command
@@ -594,9 +635,14 @@ try:
         # Startup, the final capture and ordinary stalls fit inside the extra wait.
         time.sleep(a.frames*.017384+20)
     first_poll=time.monotonic()
+    clocks=[]
     record['quiet_monitor']=a.quiet_monitor
     record['first_poll_after_launch_seconds']=first_poll-(deadline-max(180,a.frames*2))
     while True:
+        if a.clock_trace:
+            sample=execute('cat /sys/class/devfreq/sunxi-ddrfreq/cur_freq; cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq; cat /proc/loadavg').split()
+            clocks.append({'t':round(time.monotonic()-first_poll,2),'ddr':sample[0] if sample else '?','cpu0':sample[1] if len(sample)>1 else '?'})
+            (artifact/'clocks.csv').write_text('t,ddr_khz,cpu0_khz\n'+''.join(f"{c['t']},{c['ddr']},{c['cpu0']}\n" for c in clocks))
         if a.profile:
             diagnostics=execute('for p in /sys/kernel/debug/mali/utilization_gp_pp /sys/kernel/debug/mali/utilization_gp /sys/kernel/debug/mali/utilization_pp /sys/kernel/debug/clk/hosc/pll_gpu/gpu/clk_rate /sys/class/devfreq/sunxi-ddrfreq/cur_freq /proc/meminfo; do if test -f $p; then echo $p; cat $p; fi; done')
             gpu_runtime.append({'time':time.time(),'values':diagnostics})
@@ -615,6 +661,8 @@ try:
                 raise RuntimeError('Iteration failed: '+finished)
             if a.mode!='simulation':download(stem+'.png',artifact/'screen.png')
             if a.frame_trace:download(stem+'.frames',artifact/'frames.csv')
+            if a.save_state_out:
+                download(save_stem,a.save_state_out)
             if a.profile_simulation_windows or a.profile_render_windows:download(stem+'.samples.windows',artifact/'cpu.samples.windows')
             if a.atlas_layout:download(stem+'.atlas',artifact/'atlas-layout.txt')
             if a.profile:

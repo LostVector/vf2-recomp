@@ -7,7 +7,7 @@ attribute float aDepth;
 attribute vec4 aInfo0,aInfo1,aColour;
 attribute vec2 aPalette;
 uniform vec2 uSize;
-uniform float uScale;
+uniform vec2 uScale;
 #ifdef VF2_MESH_VERTEX
 // Three rows produce homogeneous clip X, Y and W. Slot zero denotes
 // a conventional screen-space packet with reciprocal depth.
@@ -32,8 +32,17 @@ void main(){
 #endif
     gl_Position=vec4(clip,aDepth*depth,depth);
     vUV0=aUV0;vUV1=aUV1;
-    vDepth=depth;vInfo0=aInfo0.xyz;vInfo1=aInfo1;vColour=aColour;
+    vDepth=depth;vColour=aColour;
+#ifdef VF2_PROBE_COMPACT_META
+    highp float flags=floor(aPalette.x/4096.0);
+    highp float mip=aInfo0.x,palette=mod(aPalette.x,4096.0);
+    vInfo0=vec3(mod(flags,2.0),mod(floor(flags/2.0),2.0),floor(flags/4.0));
+    vInfo1=vec4(aInfo1.x,mod(mip,16.0)-1.0,mod(floor(mip/16.0),4.0),floor(mip/64.0));
+    vPalette=vec2(floor(palette/1024.0)*256.0/VF2_PALETTE_X_RANGE,(mod(palette,1024.0)+0.5)/1024.0);
+#else
+    vInfo0=aInfo0.xyz;vInfo1=aInfo1;
     vPalette=vec2(aPalette.x/VF2_PALETTE_X_RANGE,(aPalette.y+0.5)/1024.0);
+#endif
 }
 )";
 inline constexpr const char *fragment_shader=R"(

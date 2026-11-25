@@ -1,5 +1,6 @@
 // Cached indexed System 24 maps. Only changed 8x8 cells cross the bus.
 #include "gpu2d.h"
+#include "render_size.h"
 #include <GLES2/gl2.h>
 #include <algorithm>
 #include <array>
@@ -479,7 +480,7 @@ void main(){
         return ok;
     }
     bool prepare(const gpu2d_frame &f)override{return stage(f)&&upload();}
-    bool paint(unsigned pass,uintptr_t target,bool flip_y,bool clear)override{
+    bool paint(unsigned pass,uintptr_t target,bool flip_y,bool clear,bool clear_depth)override{
         if(pass>=3||version==~0ull||staged)return false;
         GLint prior=0;
         if(target){
@@ -487,10 +488,11 @@ void main(){
             glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,GLuint(target),0);
             if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){glBindFramebuffer(GL_FRAMEBUFFER,prior);return false;}
         }
-        glViewport(0,0,496,384);glDisable(GL_DEPTH_TEST);glDisable(GL_SCISSOR_TEST);glDisable(GL_BLEND);glDisable(GL_CULL_FACE);glDisable(GL_DITHER);
+        glViewport(0,0,vf2_render_target_size().w,vf2_render_target_size().h);glDisable(GL_DEPTH_TEST);glDisable(GL_SCISSOR_TEST);glDisable(GL_BLEND);glDisable(GL_CULL_FACE);glDisable(GL_DITHER);
         if(clear){
             uint32_t pen=pass==0?last_pens[0]:0;
-            glClearColor(((pen>>16)&255)/255.f,((pen>>8)&255)/255.f,(pen&255)/255.f,(pen>>24)/255.f);glClear(GL_COLOR_BUFFER_BIT);
+            glClearColor(((pen>>16)&255)/255.f,((pen>>8)&255)/255.f,(pen&255)/255.f,(pen>>24)/255.f);
+            glClear(GL_COLOR_BUFFER_BIT|(clear_depth?GL_DEPTH_BUFFER_BIT:0));
         }
         glUseProgram(program);glUniform1f(flip_loc,flip_y?-1.f:1.f);
         if(gpu_line_scroll){glActiveTexture(GL_TEXTURE3);glBindTexture(GL_TEXTURE_2D,scroll_texture);}
@@ -510,9 +512,9 @@ void main(){
         if(!prepare(f))return false;
         if(!targets[0]){
             glGenTextures(3,targets);glActiveTexture(GL_TEXTURE0);
-            for(auto target:targets){glBindTexture(GL_TEXTURE_2D,target);params();glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,496,384,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);}
+            for(auto target:targets){glBindTexture(GL_TEXTURE_2D,target);params();glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,vf2_render_target_size().w,vf2_render_target_size().h,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);}
         }
-        for(unsigned i=0;i<3;i++)if(!paint(i,targets[i],false,true))return false;
+        for(unsigned i=0;i<3;i++)if(!paint(i,targets[i],false,true,false))return false;
         return true;
     }
 };

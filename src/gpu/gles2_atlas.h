@@ -26,20 +26,39 @@ class tile_atlas {
     };
     // Mesh draw keys use the high 16 bits for the mesh group.
     static constexpr unsigned luma_bit=1u<<15;
-    static constexpr size_t limit=12*1024*1024;
+    static size_t atlas_limit(){
+        static const size_t value=[]{
+            if(const char *text=std::getenv("VF2_ATLAS_LIMIT_MB")){
+                const long mb=std::strtol(text,nullptr,10);
+                if(mb>0)return size_t(mb)*1024*1024;
+            }
+            return size_t(12)*1024*1024;
+        }();
+        return value;
+    }
+    const size_t limit=atlas_limit();
     static GLenum format(bool luma){return luma?GL_LUMINANCE:GL_LUMINANCE_ALPHA;}
     bool luma_image(unsigned id)const{return fixed_luma&&(id&luma_bit);}
     unsigned logical_page(unsigned id)const{return fixed_luma?id&~luma_bit:id;}
     const backing &image(unsigned id)const{return pages[logical_page(id)].texture[luma_image(id)];}
     std::vector<page> pages;
     struct page_stamp {unsigned index;uint32_t revision;};
-    struct cached_tile {tile placed;uint32_t generation;std::vector<uint32_t> source;std::vector<page_stamp> dependencies;const uint32_t *page_source=nullptr;};
+    struct cached_tile {
+        tile placed;
+        uint32_t generation;
+        std::vector<uint32_t> source;
+        std::vector<page_stamp> dependencies;
+        const uint32_t *page_source=nullptr;
+        unsigned uniform_axes=0;
+    };
     // The records stay at stable addresses when another tile is inserted.
-    struct index_slot { uint64_t key=0; cached_tile *entry=nullptr; };
+    // The slot keeps the immutable placement and its generation inline so a
+    // steady-state lookup costs one cache line instead of chasing the record.
+    struct index_slot { uint64_t key=0; cached_tile *entry=nullptr; tile placed{}; uint32_t generation=0; };
     std::deque<cached_tile> entries;
     std::vector<index_slot> lookup_slots;
 
-    static index_slot &slot_for(std::vector<index_slot> &slots,uint64_t key){
+    static auto &slot_for(auto &slots,uint64_t key){
         uint32_t hash=uint32_t(tile_hash{}(key));
         hash^=hash>>16;
         hash*=0x7feb352du;
@@ -63,7 +82,8 @@ class tile_atlas {
             lookup_slots.swap(larger);
         }
         auto &record=entries.emplace_back(std::move(entry));
-        slot_for(lookup_slots,key)={key,&record};
+        auto &row=slot_for(lookup_slots,key);
+        row.key=key;row.entry=&record;row.placed=record.placed;row.generation=record.generation;
         return record;
     }
 
@@ -87,7 +107,7 @@ class tile_atlas {
         auto &back=p.texture[luma];
         if(back.claimed)return true;
         const size_t bytes=size_t(p.side)*p.side*(luma?1:2);
-        if(allocated+bytes>limit || (!deferred&&!create_texture(p,luma)))return false;
+        if(allocated+bytes>limit || (!deferred&&!create_texture(p,luma))){++claim_failures;return false;}
         allocated+=bytes;
         back.claimed=true;
         return true;
@@ -95,7 +115,38 @@ class tile_atlas {
 
     const bool fixed_luma=std::getenv("VF2_FIXED_ATLAS_LUMA")!=nullptr;
     const bool page_cache=std::getenv("VF2_ATLAS_PAGE_CACHE")!=nullptr;
+    const bool record_uniform_axes=std::getenv("VF2_ATLAS_UNIFORM_AXES")!=nullptr;
+    struct tile_request {
+        unsigned w,h,x,y,sheet;
+        bool transparent;
+        uint64_t key;
+    };
+    template<class Material>
+    static tile_request describe(const Material &p,int level,bool micro,bool repeat){
+        const unsigned w=micro?128:p.texw>>level,h=micro?128:p.texh>>level;
+        const unsigned x=micro?p.utexx:((uint32_t(p.texx)-2048)>>level)&2047;
+        const unsigned y=micro?p.utexy:((uint32_t(p.texy)-1024)>>level)&1023;
+        const unsigned sheet=p.sheet^(micro?1:(level&1));
+        const bool transparent=p.renderer&1;
+        const uint64_t key=x|(uint64_t(y)<<11)|(uint64_t(w)<<21)|(uint64_t(h)<<33)|(uint64_t(sheet)<<45)|
+            (uint64_t(bool(p.wrapx))<<46)|(uint64_t(bool(p.wrapy))<<47)|(uint64_t(transparent)<<48)|(uint64_t(repeat)<<49);
+        return {w,h,x,y,sheet,transparent,key};
+    }
 public:
+    bool records_uniform_axes()const{return record_uniform_axes;}
+    template<class Material>
+    unsigned current_uniform_axes(const gpu3d_rams &rams,const Material &p,int level)const{
+        if(lookup_slots.empty()||p.sheet>1)return 0;
+        const auto request=describe(p,level,false,false);
+        const auto &slot=slot_for(lookup_slots,request.key);
+        if(!slot.entry||slot.generation!=rams.gen[request.sheet])return 0;
+        return slot.entry->uniform_axes;
+    }
+    static size_t capacity_bytes(){return atlas_limit();}
+    size_t allocated_bytes()const{return allocated;}
+    // Counts atlas page claims that the byte budget refused. A frame that
+    // trips this can discard the stale pages and rebuild in one pass.
+    uint64_t claim_failures=0;
     uint64_t uploaded=0,clears=0;
     uint64_t page_hits=0,source_checks=0,source_words=0;
     tile_atlas()=default;
@@ -148,7 +199,8 @@ public:
         const recipe p{unsigned((key>>21)&4095),unsigned((key>>33)&4095),
             unsigned(key&2047)+2048,unsigned((key>>11)&1023)+1024,
             unsigned((key>>45)&1),unsigned((key>>48)&1),unsigned((key>>46)&1),unsigned((key>>47)&1)};
-        return get(rams,p,0,false,key&(1ull<<49))!=nullptr;
+        tile placed;
+        return get(rams,p,0,false,key&(1ull<<49),placed);
     }
     size_t page_count()const{return pages.size();}
     size_t resident()const{return entries.size();}
@@ -168,39 +220,57 @@ public:
         transform[3]=transform[3]*sy+float(t.y+1)/t.side;
     }
     template<class Material>
-    std::pair<const tile *,const tile *> get_pair(const gpu3d_rams &rams,const Material &p,
-                                                   int band,int max_level,bool native_repeat){
+    bool get_pair(const gpu3d_rams &rams,const Material &p,
+                  int band,int max_level,bool native_repeat,tile &a,tile &b){
         const int first=std::max(0,band);
         const int second=band<0?0:std::min(band+1,max_level);
         const bool micro=band<0&&p.utex;
         // Preserve the original atlas placements even when rendering this
         // pair from standalone textures.
-        const auto *a=get(rams,p,first,false);
-        if(!a)return {};
-        const auto *b=get(rams,p,second,micro);
-        if(!b)return {};
-        if(!native_repeat)return {a,b};
-        const auto *repeat_a=get(rams,p,first,false,true);
-        if(!repeat_a)return {};
-        return {repeat_a,get(rams,p,second,micro,true)};
+        if(!get(rams,p,first,false,false,a))return false;
+        // The top mip pairs with itself; reuse it instead of resolving twice.
+        if(second==first&&!micro)b=a;
+        else if(!get(rams,p,second,micro,false,b))return false;
+        if(!native_repeat)return true;
+        tile repeat_a,repeat_b;
+        if(!get(rams,p,first,false,true,repeat_a))return false;
+        if(second==first&&!micro)repeat_b=repeat_a;
+        else if(!get(rams,p,second,micro,true,repeat_b))return false;
+        a=repeat_a;b=repeat_b;
+        return true;
     }
     template<class Material>
-    const tile *get(const gpu3d_rams &rams,const Material &p,int level,bool micro,bool repeat=false){
-        unsigned w=micro?128:p.texw>>level,h=micro?128:p.texh>>level;
-        unsigned x=micro?p.utexx:((uint32_t(p.texx)-2048)>>level)&2047;
-        unsigned y=micro?p.utexy:((uint32_t(p.texy)-1024)>>level)&1023;
-        unsigned sheet=p.sheet^(micro?1:(level&1));bool transparent=p.renderer&1;
+    bool pair_current(const gpu3d_rams &rams,const Material &p,int band,int max_level,bool native_repeat)const{
+        if(lookup_slots.empty())return false;
+        const int first=std::max(0,band);
+        const int second=band<0?0:std::min(band+1,max_level);
+        const bool micro=band<0&&p.utex;
+        const auto current=[&](int level,bool use_micro,bool repeat){
+            const auto request=describe(p,level,use_micro,repeat);
+            const auto &slot=slot_for(lookup_slots,request.key);
+            return slot.entry&&slot.generation==rams.gen[request.sheet];
+        };
+        if(!current(first,false,false)||((first!=second||micro)&&!current(second,micro,false)))return false;
+        return !native_repeat||(current(first,false,true)&&
+            ((first==second&&!micro)||current(second,micro,true)));
+    }
+    template<class Material>
+    bool get(const gpu3d_rams &rams,const Material &p,int level,bool micro,bool repeat,tile &out){
+        const auto [w,h,x,y,sheet,transparent,key]=describe(p,level,micro,repeat);
         const bool luma=fixed_luma&&!transparent;
         const unsigned channels=luma?1:2;
-        uint64_t key=x|(uint64_t(y)<<11)|(uint64_t(w)<<21)|(uint64_t(h)<<33)|(uint64_t(sheet)<<45)|
-            (uint64_t(bool(p.wrapx))<<46)|(uint64_t(bool(p.wrapy))<<47)|(uint64_t(transparent)<<48)|(uint64_t(repeat)<<49);
-        auto *found=find_entry(key);
-        if(found&&found->generation==rams.gen[sheet])return &found->placed;
+        // The slot carries the placement and generation, so a warm lookup only
+        // touches the slot instead of the record it points at.
+        cached_tile *found=nullptr;
+        index_slot *slot=lookup_slots.empty()?nullptr:&slot_for(lookup_slots,key);
+        if(slot)found=slot->entry;
+        const uint32_t generation=rams.gen[sheet];
+        if(found&&slot->generation==generation){out=slot->placed;return true;}
         const uint32_t *revisions=page_cache?rams.tex_page_gen[sheet]:nullptr;
         if(found&&revisions&&found->page_source==revisions&&!found->dependencies.empty()){
             bool same=true;
             for(const auto &stamp:found->dependencies)if(revisions[stamp.index]!=stamp.revision){same=false;break;}
-            if(same){++page_hits;found->generation=rams.gen[sheet];return &found->placed;}
+            if(same){++page_hits;found->generation=generation;if(slot)slot->generation=generation;out=slot?slot->placed:found->placed;return true;}
         }
         // A packed word covers four columns by two rows. Retain all words
         // touched by the tile (including partial edge words), so generation
@@ -226,12 +296,12 @@ public:
         ++source_checks;source_words+=source.size();
         if(found&&found->source==source){
             found->dependencies=std::move(dependencies);found->page_source=revisions;
-            found->generation=rams.gen[sheet];return &found->placed;
+            found->generation=generation;if(slot)slot->generation=generation;out=slot?slot->placed:found->placed;return true;
         }
         tile placed{};
         if(found)placed=found->placed;
         else if(repeat){
-            if(w!=h||(w&(w-1))||!w||!add_page(w,true,luma))return nullptr;
+            if(w!=h||(w&(w-1))||!w||!add_page(w,true,luma))return false;
             placed={0,0,w,h,unsigned(pages.size()-1),w};
             placed.transform[0]=placed.transform[1]=1.f;
         }else {
@@ -244,7 +314,7 @@ public:
             auto &p=pages[index];if(p.side!=side||p.repeat)continue;
             for(auto &s:p.shelves)if(s.height==h+2&&s.x+w+2<=side){row=&s;break;}
             if(!row&&p.next_y+h+2>side)continue;
-            if(!claim_backing(p,luma))return nullptr;
+            if(!claim_backing(p,luma))return false;
             if(!row){
                 p.shelves.push_back({p.next_y,h+2,0});
                 p.next_y+=h+2;
@@ -253,7 +323,7 @@ public:
             break;
         }
         if(!row){
-            if(!add_page(side,false,luma))return nullptr;
+            if(!add_page(side,false,luma))return false;
             index=pages.size()-1;auto &p=pages.back();p.shelves.push_back({0,h+2,0});p.next_y=h+2;row=&p.shelves.back();
         }
         placed={row->x,row->y,w,h,index,side};row->x+=w+2;
@@ -272,6 +342,19 @@ public:
                 const size_t at=(size_t(v)*w+u)*channels;
                 data[at]=index<<4;
                 if(!luma)data[at+1]=transparent&&index==15?0:255;
+            }
+        }
+        unsigned uniform_axes=0;
+        if(record_uniform_axes&&!transparent&&w&&h&&w<=128&&h<=128){
+            // Bit 0 means each row is constant. Bit 1 means each column is constant.
+            uniform_axes=3;
+            for(unsigned v=0;v<h&&uniform_axes;++v){
+                const auto *row=data.data()+size_t(v)*w*channels;
+                for(unsigned u=0;u<w&&uniform_axes;++u){
+                    const size_t offset=size_t(u)*channels;
+                    if(row[offset]!=row[0])uniform_axes&=~1u;
+                    if(row[offset]!=data[offset])uniform_axes&=~2u;
+                }
             }
         }
         static const bool row_copy=std::getenv("VF2_ATLAS_TILE_EDGES")!=nullptr;
@@ -313,9 +396,10 @@ public:
         }
         if(found){
             found->dependencies=std::move(dependencies);found->page_source=revisions;
-            found->source=std::move(source);found->generation=rams.gen[sheet];return &found->placed;
+            found->uniform_axes=uniform_axes;
+            found->source=std::move(source);found->generation=generation;if(slot)slot->generation=generation;out=found->placed;return true;
         }
-        return &insert_entry(key,{placed,rams.gen[sheet],std::move(source),std::move(dependencies),revisions}).placed;
+        out=insert_entry(key,{placed,generation,std::move(source),std::move(dependencies),revisions,uniform_axes}).placed;return true;
     }
 };
 }

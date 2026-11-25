@@ -3363,6 +3363,10 @@ void model2_video::geometry_wait(){
     m_geometry_job->wait_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count());
 }
 
+uint64_t model2_video::geometry_job_wait_ns() const {
+    return m_geometry_job ? m_geometry_job->wait_ns : 0;
+}
+
 void model2_video::execute_geometry_job(){
     const auto start=std::chrono::steady_clock::now();auto &job=*m_geometry_job;
     std::fenv_t previous{};std::fegetenv(&previous);std::fesetenv(&job.list.environment);

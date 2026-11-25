@@ -96,6 +96,7 @@ public:
     void invalidate_geometry_pages(){m_geometry_dirty_pages=~uint32_t(0);}
     bool observe_geometry_worker(std::function<void()> observer);
     void geometry_wait();
+    uint64_t geometry_job_wait_ns() const;
     void reset_geometry_job_stats();
     void report_geometry_jobs(FILE *out);
     uint64_t geometry_job_count();

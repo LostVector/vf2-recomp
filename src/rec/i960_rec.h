@@ -39,7 +39,11 @@ struct stats
 
 struct runtime
 {
+#ifdef MODEL2_ORIGINAL
+	static constexpr uint32_t LIMIT = 0x240000;   // includes the read-only ROM mirror
+#else
 	static constexpr uint32_t LIMIT = 0x200000;   // the program ROM
+#endif
 	std::vector<fn_t> table;     // per instruction address / 4: the function to enter there, or null
 	// plain memory (no device behind it, no side effects, MAME's BURST flag), per 4 KB page below
 	// PAGES << 12: where it is, for reads and for writes (null: through the bus)

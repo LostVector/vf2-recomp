@@ -17,9 +17,16 @@
 #include <cstdlib>
 #include <bit>
 #include <random>
+#include <unordered_map>
 #if defined(__linux__)
 #include <sys/mman.h>
 #include <unistd.h>
+#include <fcntl.h>
+#endif
+
+#ifdef MODEL2_ORIGINAL
+#include "model2_original.inc"
+#include "model1_sound.inc"
 #endif
 
 // ---------------------------------------------------------------------------------------------
@@ -78,7 +85,16 @@ struct model2a::tgp_bus : mb86233_bus
 	u32 memory_r(u32 offset)
 	{
 		u32 adr = (bank_reg & 0xff0000) | offset;
-		if (adr & 0x800000) return 0;    // copro_data: empty on VF2
+		if (adr & 0x800000) {
+#ifdef MODEL2_ORIGINAL
+			const auto &rom = m.m_roms.regions[romset::COPRO_DATA];
+			u32 word;
+			memcpy(&word, &rom[(adr * 4) & (rom.size() - 1)], sizeof(word));
+			return word;
+#else
+			return 0;    // copro_data: empty on VF2
+#endif
+		}
 		if (adr & 0x400000) { u32 v; memcpy(&v, &m.m_bufferram[(adr & 0x7fff) * 4], 4); return v; }
 		return 0;
 	}
@@ -193,6 +209,14 @@ mb86233_device &model2a::tgp() { return m_tgp->cpu; }
 
 // ---------------------------------------------------------------------------------------------
 
+romset::result model2a::take_sound_regions()
+{
+	romset::result r;
+	r.regions[romset::AUDIOCPU]=std::move(m_roms.regions[romset::AUDIOCPU]);
+	r.regions[romset::SAMPLES]=std::move(m_roms.regions[romset::SAMPLES]);
+	return r;
+}
+
 #if defined(__linux__)
 // Never discard allocator headers or adjoining allocations at the ends.
 static void discard_zero_rom_pages(std::span<const u8> region)
@@ -200,6 +224,7 @@ static void discard_zero_rom_pages(std::span<const u8> region)
     const long system_page = sysconf(_SC_PAGESIZE);
     if (system_page <= 0 || region.empty()) return;
     const size_t page = size_t(system_page);
+    if (page & (page - 1)) return;
     const uintptr_t address = reinterpret_cast<uintptr_t>(region.data());
     const uintptr_t begin = (address + page - 1) & ~uintptr_t(page - 1);
     const uintptr_t end = (address + region.size()) & ~uintptr_t(page - 1);
@@ -219,12 +244,152 @@ static void discard_zero_rom_pages(std::span<const u8> region)
 }
 #endif
 
+#if defined(__linux__) && defined(MODEL2_ORIGINAL)
+// Shares identical 4 KiB pages of a read-only region through one file-backed
+// MAP_SHARED mapping, so a run of duplicate pages (or the all-0xff padding)
+// costs one physical frame instead of many. The region's bytes are unchanged:
+// each folded page reads the same content from the shared frame, so bus reads,
+// direct ROM pointers and the JIT page table all see identical bytes. Unlike
+// MADV_DONTNEED (which only suits zero pages, since a re-fault gives zero),
+// this preserves 0xff and arbitrary duplicate content.
+//
+// The backing lives in a RAM-backed file (the emulator's /run home): create,
+// write one frame per shared group, mmap it MAP_SHARED, then unlink and close
+// - the mappings keep the inode and its pages alive. Kernel 3.4 has no
+// memfd_create and the device has no /dev/shm, so a tmpfs file is the shared
+// primitive. Returns the number of private frames released.
+static size_t share_region_pages(std::vector<u8> &region, const char *tag, const char *dir)
+{
+	const size_t page = size_t(sysconf(_SC_PAGESIZE));
+	if (!page || (page & (page-1)) || region.size() < 2 * page) return 0;
+	uintptr_t base = reinterpret_cast<uintptr_t>(region.data());
+	uintptr_t begin = (base + page - 1) & ~uintptr_t(page - 1);
+	uintptr_t end = (base + region.size()) & ~uintptr_t(page - 1);
+	size_t npages = (end - begin) / page;
+	if (npages < 2) return 0;
+
+	std::vector<u8> zero(page, 0), ones(page, 0xff);
+	// Hash each page (FNV over 64-bit words) and bucket by hash; a bucket's
+	// members are memcmp-confirmed before sharing, so a hash collision can
+	// never fold two different pages together.
+	std::vector<uint64_t> hash(npages);
+	for (size_t i = 0; i < npages; i++) {
+		const uint64_t *w = reinterpret_cast<const uint64_t *>(begin + i * page);
+		uint64_t x = 1469598103934665603ull;
+		for (size_t k = 0; k < page / 8; k++) { x ^= w[k]; x *= 1099511628211ull; }
+		hash[i] = x;
+	}
+	// representative[i]: the first page index sharing i's content, or i itself.
+	// SIZE_MAX marks "not yet assigned" so that a canonical of index 0 is valid.
+	std::vector<size_t> rep(npages, SIZE_MAX);
+	std::unordered_map<uint64_t, std::vector<size_t>> buckets;
+	for (size_t i = 0; i < npages; i++) buckets[hash[i]].push_back(i);
+	for (auto &kv : buckets) {
+		std::vector<size_t> &v = kv.second;
+		size_t canon = v[0];
+		rep[canon] = canon;
+		for (size_t j = 1; j < v.size(); j++) {
+			// confirm against the canonical; a 64-bit hash collision is treated
+			// conservatively as its own singleton (never fold two different pages).
+			if (!std::memcmp(reinterpret_cast<const void *>(begin + v[j] * page),
+			                 reinterpret_cast<const void *>(begin + canon * page), page)) rep[v[j]] = canon;
+			else rep[v[j]] = v[j];
+		}
+	}
+	// Assign a backing slot to each group that has >1 member and is not all-zero
+	// (zero pages are already freed by the DONTNEED pass; sharing them would
+	// fault them back). The canonical page's slot holds its content.
+	std::unordered_map<size_t, off_t> slot;   // canonical page index -> file offset
+	std::vector<u8> backing;
+	for (size_t i = 0; i < npages; i++) {
+		size_t c = rep[i];
+		if (c == i) continue;                 // canonical or singleton: handled at its own index
+		if (slot.count(c)) continue;          // slot already made for this group
+		const void *p = reinterpret_cast<const void *>(begin + c * page);
+		if (!std::memcmp(p, zero.data(), page)) continue;   // leave zero pages alone
+		off_t off = off_t(backing.size());
+		backing.insert(backing.end(), (const u8 *)p, (const u8 *)p + page);
+		slot[c] = off;
+	}
+	if (backing.empty()) return 0;
+
+	std::string path = std::string(dir) + "/.romshare." + tag + ".XXXXXX";
+	int fd = mkstemp(path.data());
+	if (fd < 0) return 0;
+	struct statfs fs{};
+	if (unlink(path.c_str()) != 0 || fstatfs(fd, &fs) != 0
+		|| (fs.f_type != TMPFS_MAGIC && fs.f_type != RAMFS_MAGIC)) {
+		close(fd);
+		return 0;
+	}
+	fcntl(fd, F_SETFD, FD_CLOEXEC);
+	// tmpfs: write the shared frames, then map them read-only over every member.
+	for (size_t done = 0; done < backing.size(); ) {
+		ssize_t n = ::pwrite(fd, backing.data() + done, backing.size() - done, off_t(done));
+		if (n < 0 && errno == EINTR) continue;
+		if (n <= 0) { ::close(fd); return 0; }
+		done += size_t(n);
+	}
+	size_t freed = 0;
+	// Fold every member of a shared group, the canonical included: leaving the
+	// canonical as its own anon page would cost one anon + one shared frame per
+	// pair (no saving). Folding all members makes the whole group read one frame.
+	for (size_t i = 0; i < npages; i++) {
+		auto it = slot.find(rep[i]);
+		if (it == slot.end()) continue;   // singleton or zero group: leave the anon page
+		void *at = mmap(reinterpret_cast<void *>(begin + i * page), page, PROT_READ,
+		                MAP_SHARED | MAP_FIXED, fd, it->second);
+		if (at == MAP_FAILED) continue;
+		freed++;
+	}
+	::close(fd);
+	return freed;
+}
+#endif
+
 void model2a::release_unused_roms()
 {
-    for (int id : {romset::COPRO_DATA, romset::OTHER_DATA, romset::VIDEO_UNK})
-        std::vector<u8>().swap(m_roms.regions[id]);
+	for (int id : {
+#ifndef MODEL2_ORIGINAL
+			romset::COPRO_DATA,
+#endif
+			romset::OTHER_DATA, romset::VIDEO_UNK})
+		std::vector<u8>().swap(m_roms.regions[id]);
 #if defined(__linux__)
-    for (const auto &region : m_roms.regions) discard_zero_rom_pages(region);
+	for (const auto &region : m_roms.regions) discard_zero_rom_pages(region);
+#ifdef MODEL2_ORIGINAL
+	const size_t page = size_t(sysconf(_SC_PAGESIZE));
+	if (!page || (page & (page - 1))) return;
+	// The MAIN_DATA mirrors fold to their source block (see fold_data), so their
+	// physical pages are never read once the region has been hashed. Discard the
+	// seven mirror pages: 7 MiB on Daytona. The source block stays resident.
+	if (m_mirror_size && !m_data.empty()) {
+		uintptr_t mb=(reinterpret_cast<uintptr_t>(m_data.data())+m_mirror_base+m_mirror_size+page-1)&~uintptr_t(page-1);
+		uintptr_t me=(reinterpret_cast<uintptr_t>(m_data.data())+m_mirror_end)&~uintptr_t(page-1);
+		if(me>mb)madvise(reinterpret_cast<void*>(mb),me-mb,MADV_DONTNEED);
+	}
+	// Fold duplicate and all-0xff pages of the read-only GPU data regions onto
+	// shared frames (see share_region_pages). Off by default; the release path is
+	// byte-exact without it. VF2_ROM_DEDUP=1 shares polygons; add tex/copro for
+	// those regions too. Backing file goes in the emulator's RAM-backed home.
+	if (const char *dd = std::getenv("VF2_ROM_DEDUP")) {
+		const char *dir = std::getenv("VF2_ROM_DEDUP_DIR"); if (!dir) dir = "/run/daytona";
+		const std::string want(dd);
+		struct { const char *flag; int region; const char *tag; } sel[] = {
+			{"1", romset::POLYGONS, "poly"}, {"copro", romset::COPRO_DATA, "copro"},
+			{"tex", romset::TEXTURES, "tex"},
+		};
+		for (auto &s : sel) {
+			if (want != s.flag && want.find(s.flag) == std::string::npos) continue;
+			std::vector<u8> &r = m_roms.regions[s.region];
+			if (r.empty()) continue;
+			size_t f = share_region_pages(r, s.tag, dir);
+			std::fprintf(stderr, "ROM dedup %s: %zu pages (%zu KiB) folded to shared frames\n",
+				s.tag, f, f * page / 1024);
+		}
+	}
+#endif
+
 #endif
 }
 
@@ -232,14 +397,55 @@ struct model2a::compact_roms {
     rom_page_mapping data, polygons, textures;
 };
 
+void model2a::rom_residency_report() const
+{
+#if defined(__linux__)
+	const size_t page=size_t(sysconf(_SC_PAGESIZE));
+	if(!page||(page&(page-1)))return;
+	std::fprintf(stderr,"ROM residency report (page %zu B):\n",page);
+	size_t total_virt=0,total_res=0;
+	for(int id=0;id<romset::N_REGIONS;++id){
+		std::span<const u8> region=m_roms.regions[id];
+		if (id == romset::MAIN_DATA) region = m_data;
+		if (id == romset::TEXTURES) region = m_texture_rom;
+		if (id == romset::POLYGONS && m_compact_roms && !m_compact_roms->polygons.bytes().empty())
+			region = m_compact_roms->polygons.bytes();
+		if(region.empty())continue;
+		uintptr_t begin=(reinterpret_cast<uintptr_t>(region.data())+page-1)&~uintptr_t(page-1);
+		uintptr_t end=(reinterpret_cast<uintptr_t>(region.data())+region.size())&~uintptr_t(page-1);
+		if(end<=begin)continue;
+		size_t pages=(end-begin)/page,resident=0;
+		std::vector<unsigned char> vec(pages);
+		if(mincore(reinterpret_cast<void*>(begin),pages*page,vec.data())==0)
+			for(size_t i=0;i<pages;++i)resident+=vec[i]&1;
+		total_virt+=region.size();total_res+=resident*page;
+		std::fprintf(stderr,"  %-12s %08lx-%08lx %7zu kB  resident %7zu kB\n",
+			romset::region_name(id),reinterpret_cast<uintptr_t>(region.data()),
+			reinterpret_cast<uintptr_t>(region.data())+region.size(),region.size()/1024,resident*page/1024);
+	}
+	std::fprintf(stderr,"  total virtual %zu kB, resident %zu kB\n",total_virt/1024,total_res/1024);
+	// mincore counts a shared frame once per virtual mapping, so it cannot show
+	// the physical saving from share_region_pages; MemFree can. Report it here so
+	// a dedup run and a plain run at the same frame compare directly on real RAM.
+	if (FILE *f = std::fopen("/proc/meminfo", "r")) {
+		char line[128]; unsigned long mf = 0, ma = 0;
+		while (std::fgets(line, sizeof line, f))
+			if (!std::sscanf(line, "MemFree: %lu kB", &mf)) std::sscanf(line, "MemAvailable: %lu kB", &ma);
+		std::fclose(f);
+		std::fprintf(stderr,"  MemFree %lu kB, MemAvailable %lu kB\n", mf, ma);
+	}
+#endif
+}
+
 model2a::model2a(romset::result &&roms, bool recompile, bool compact_rom)
 	: m_roms(std::move(roms)), m_rom(m_roms.regions[romset::MAINCPU]), m_data(m_roms.regions[romset::MAIN_DATA]),
 	  m_texture_rom(m_roms.regions[romset::TEXTURES]),
 	  m_cpu(*this)
 {
+	if (m_roms.mirror_region == romset::MAIN_DATA) { m_mirror_base = m_roms.mirror_base; m_mirror_size = m_roms.mirror_size; m_mirror_end = m_roms.mirror_end; }
 	for (const std::vector<u8> &r : m_roms.regions) m_rom_hash = m_rom_hash * 0x100000001B3ull ^ m2::state_hash(r.data(), r.size());
     std::span<const u8> poly = m_roms.regions[romset::POLYGONS];
-#if defined(__linux__)
+#if defined(__linux__) && !defined(MODEL2_ORIGINAL)
     if (compact_rom) {
         // Reclaim zero padding ahead of staging the new backing so peak
         // physical usage stays bounded. The original hash remains the save
@@ -263,6 +469,10 @@ model2a::model2a(romset::result &&roms, bool recompile, bool compact_rom)
     }
 #else
     (void)compact_rom;
+#endif
+#ifdef MODEL2_ORIGINAL
+	m_rom_hash = m_rom_hash * 0x100000001B3ull ^ m2::state_hash(m_roms.io_firmware.data(), m_roms.io_firmware.size());
+	m_original_io = std::make_unique<original_io_board>(*this);
 #endif
 	m_tgp = std::make_unique<tgp_bus>(*this);
 	m_ram200.assign(0x40000, 0);
@@ -294,8 +504,12 @@ model2a::model2a(romset::result &&roms, bool recompile, bool compact_rom)
 	// I80960KB at 50 MHz / 2; MB86234 at 50 MHz, a cycle every 3 clocks
 	m_sched[CPU_I960].set_rate(25000000);
 	m_sched[CPU_TGP].set_rate((50000000 + 3 - 1) / 3);
-	m_sched[CPU_68K].set_rate(45158400 / 4);
+	m_sched[CPU_68K].set_rate(SOUND_CPU_CLOCK);
+#ifdef MODEL2_ORIGINAL
+	m_sched[CPU_Z80].set_rate(32000000 / 8);
+#else
 	m_sched[CPU_Z80].set_rate(32000000 / 4);
+#endif
 	// the i960's program recompiled to native code now (src/rec), unless VF2_INTERP is set (MAME's
 	// interpreter: the reference, cycle for cycle the same)
 	if (recompile && !getenv("VF2_INTERP")) use_native();
@@ -589,6 +803,10 @@ bool model2a::patch_program(u32 addr, const u8 *to, size_t n, u32 check, size_t 
 static u32 rom_word(void *ctx, u32 a)
 {
 	auto &rom = *static_cast<const std::vector<u8> *>(ctx);
+#ifdef MODEL2_ORIGINAL
+	if (a >= 0x00220000 && a < 0x00240000) a -= 0x00200000;
+	else if (a >= 0x00040000) return 0;
+#endif
 	u32 v = 0;
 	if (a + 4 <= rom.size()) memcpy(&v, &rom[a], 4);
 	return v;
@@ -596,6 +814,9 @@ static u32 rom_word(void *ctx, u32 a)
 
 bool model2a::use_generated()
 {
+#ifdef MODEL2_ORIGINAL
+	return false;
+#endif
 	if (!i960rec::gen_nfns) return false;
 	auto r = std::make_unique<i960rec::runtime>();
 	r->cpu = &m_cpu;
@@ -609,14 +830,33 @@ bool model2a::use_generated()
 bool model2a::use_native(const std::string &map_path, i960rec::native_stats *stats)
 {
 	i960rec::hints map;
-	if (map_path.empty()) map.parse(i960rec::vf2_map_text);
+	if (map_path.empty()) {
+#ifdef MODEL2_ORIGINAL
+		map.parse(
+#include "../rec/daytona_map.inc"
+		);
+		const char *extended_map = std::getenv("DAYTONA_EXTENDED_I960_MAP");
+		if (extended_map && extended_map[0] == '1' && extended_map[1] == '\0') {
+			map.parse(
+#include "../rec/daytona_extended_map.inc"
+			);
+		}
+#else
+		map.parse(i960rec::vf2_map_text);
+#endif
+	}
 	else if (!map.read(map_path)) return false;
 	auto r = std::make_unique<i960rec::runtime>();
 	r->cpu = &m_cpu;
 	auto &rom = m_roms.regions[romset::MAINCPU];
 	map_plain_pages(*r);
 	i960rec::native_stats st;
-	if (!i960rec::build_native(*r, rom_word, (void *)&rom, u32(rom.size()), map, &st)) return false;
+#ifdef MODEL2_ORIGINAL
+	const u32 code_limit = i960rec::runtime::LIMIT;
+#else
+	const u32 code_limit = u32(rom.size());
+#endif
+	if (!i960rec::build_native(*r, rom_word, (void *)&rom, code_limit, map, &st)) return false;
 	m_native_stats = st;
 	if (stats) *stats = st;
 	m_rec = std::move(r);
@@ -743,6 +983,9 @@ void model2a::reset()
 	for (int i = 0; i < N_CPUS; i++) m_order[i] = i;
 	m_suspend_changes = false;
 	if (!m_sound_on) suspend(CPU_68K, SUSPEND_HALT);   // the debugger's `suspend :audiocpu`, before it runs at all
+#ifdef MODEL2_ORIGINAL
+	if (m_sound_only) suspend(CPU_Z80, SUSPEND_HALT);
+#endif
 	// Cost probe only: run the board's timers, UART link and scheduler while
 	// holding the 68000, to separate its execution cost from the rest.
 	if (m_sound_on && std::getenv("VF2_68K_HALT")) suspend(CPU_68K, SUSPEND_HALT);
@@ -768,11 +1011,16 @@ void model2a::reset()
 	m_io_config = 0xff; m_io_mode = 0; m_io_analog = 0;
 	m_eeprom.state = eeprom93c46::IN_RESET; m_eeprom.locked = true; m_eeprom.bits = 0;
 	m_eeprom.cs = m_eeprom.clk = m_eeprom.di = 0; m_eeprom.completion = 0;
+#ifdef MODEL2_ORIGINAL
+	m_original_io->reset();
+#endif
 	m_uart = uart8251{};
 	m_m2comm_cn = m_m2comm_fg = 0;
 	sound_reset();
-	m_cpu.reset();
-	for (int l = 0; l < 4; l++) m_cpu.set_input_line(l, CLEAR_LINE);
+    if (!m_sound_only) {
+        m_cpu.reset();
+        for (int l = 0; l < 4; l++) m_cpu.set_input_line(l, CLEAR_LINE);
+    }
 	// the screen starts at the top of vblank (line 384): the first vblank is a frame later
 	timer_adjust(T_VBLANK_START, atime(CYCLES_PER_FRAME) * m_sched[CPU_I960].period);
 	// the UART's clock: low from the start, a toggle every 1 us (or with the byte link, T_UART only
@@ -950,6 +1198,13 @@ template <class IO> void model2a::state(IO &io)
 	}
 	io.pod(m_in0); io.pod(m_in1); io.pod(m_in2); io.pod(m_sw);
 	io.pod(m_io_port); io.pod(m_io_config); io.pod(m_io_mode); io.pod(m_io_analog); io.pod(m_ctrlmode);
+#ifdef MODEL2_ORIGINAL
+	// The filtered analog pedals/steering and the gear latch: the I/O board's
+	// Z80 reads these as the last inputs, so a continued run needs the values
+	// the host had reached (a fresh process starts at the defaults).
+	io.bytes(m_driving_analog.data(), m_driving_analog.size());
+	io.pod(m_driving_gear);
+#endif
 	io.section("eeprom");
 	eeprom93c46 &e = m_eeprom;
 	io.pod(e.cells); io.pod(e.cs); io.pod(e.clk); io.pod(e.di);
@@ -966,6 +1221,12 @@ template <class IO> void model2a::state(IO &io)
 	attos(io, m_link_t0);
 	io.pod(m_link_delivered); io.pod(m_link_in_step); io.pod(m_link_byte);
 	io.pod(m_m2comm_cn); io.pod(m_m2comm_fg);
+#ifdef MODEL2_ORIGINAL
+	// The cabinet's own I/O board: the i960 reads its shared RAM for inputs, so
+	// its Z80 and shared memory are part of the running machine.
+	io.section("io board");
+	m_original_io->state(io);
+#endif
 	if (random_fighters_on()) {   // (online: on on both sides or neither, from the host's blob)
 		io.section("random fighters");
 		random_state(io);
@@ -1052,6 +1313,27 @@ void model2a::save_state(std::vector<uint8_t> &out, std::vector<m2::StateSection
 	// model2_video::keep_geo. Only where there are pictures)
 	if (m_draw_3d || m_video->smooth()) m_video->keep_geo(uint64_t(m_snap_epoch) << 32 | m_snap_gen);
 	m_snap_gen++;   // (writes from now on are after this save)
+}
+
+bool model2a::save_state_file(m2::FileStateWriter &w, size_t &core_bytes)
+{
+	advance_aux_clocks(m_base);
+	render_wait();   // (a picture being drawn alongside may have taken the 3D's RAMs back for a moment)
+	state_header h{ STATE_MAGIC, STATE_VERSION, m_snap_id, m_snap_epoch, m_snap_gen, 0 };
+	w.bytes(&h, sizeof h);
+	w.bytes(m_ram200.data(), m_ram200.size());
+	w.bytes(m_workram.data(), m_workram.size());
+	w.bytes(m_bufferram.data(), m_bufferram.size());
+	w.bytes(m_cpuctl.data(), m_cpuctl.size());
+	w.bytes(m_m2comm_share.data(), m_m2comm_share.size());
+	w.bytes(m_backup.data(), m_backup.size());
+	for (int r = 0; r < PAGED; r++) w.bytes(paged_base(r), paged_bytes(r));
+	state(w);
+	core_bytes = w.count;
+	if (w.failed) return false;
+	if (m_draw_3d || m_video->smooth()) m_video->keep_geo(uint64_t(m_snap_epoch) << 32 | m_snap_gen);
+	m_snap_gen++;   // (writes from now on are after this save)
+	return true;
 }
 
 bool model2a::load_state(const uint8_t *p, size_t n)
@@ -1157,6 +1439,11 @@ static const bool g_fast_halt_delivery = getenv("VF2_FAST_HALT_DELIVERY") != nul
 static const bool g_fuse_fifo_halt = getenv("VF2_FUSE_FIFO_HALT") != nullptr;
 static const bool g_fixed_fifo_store = getenv("VF2_I960_FIXED_FIFO_STORE") != nullptr;
 static const bool g_fixed_fifo_load = getenv("VF2_I960_FIXED_FIFO_LOAD") != nullptr;
+#ifdef MODEL2_ORIGINAL
+static const bool g_fast_device_dword = getenv("DAYTONA_NO_FAST_DEVICE_DWORD") == nullptr;
+#else
+static constexpr bool g_fast_device_dword = false;
+#endif
 static const u16 g_fifo_port_flags=(g_fixed_fifo_store?VF2_FIXED_STORE_PORT:0)|
                                   (g_fixed_fifo_load?VF2_FIXED_LOAD_PORT:0);
 static const bool g_reference_timers = getenv("VF2_REFERENCE_TIMERS") != nullptr;
@@ -1484,6 +1771,15 @@ void model2a::advance_aux_clocks(const atime &target)
 
 template<bool LazyAux,bool NarrowGap,bool Modular,bool FrameDivision,bool SkipInert> void model2a::timeslice_impl()
 {
+#ifdef MODEL2_ORIGINAL
+    // With byte-level UART, idle serial clocks no longer bound scheduler
+    // passes. Daytona also polls DSP results in shared RAM without a FIFO
+    // stall, so cap a pass while the DSP can make progress.
+    static const atime tgp_quantum=[] {
+        const char *value=std::getenv("DAYTONA_TGP_QUANTUM_US");
+        return value?atime(std::min(std::strtoul(value,nullptr,10),1000ul))*(AS_PER_SEC/1000000):atime(0);
+    }();
+#endif
     using clock_type=std::conditional_t<Modular,uint64_t,atime>;
     auto clock=[](atime t)->clock_type {if constexpr(Modular)return uint64_t(t);else return t;};
     auto less=[](clock_type a,clock_type b){if constexpr(Modular)return vf2::frame_clock::less(a,b);else return a<b;};
@@ -1497,6 +1793,12 @@ template<bool LazyAux,bool NarrowGap,bool Modular,bool FrameDivision,bool SkipIn
         clock_type target=clock(initial_target);
         auto absolute_target=[&]()->atime{if constexpr(Modular)return vf2::frame_clock::restore(initial_target,target);else return target;};   // (MAME's 1/60 s quantum never comes first here)
 		if (m_suspend_changes) apply_suspend_changes();
+#ifdef MODEL2_ORIGINAL
+        if(tgp_quantum&&m_link_fast&&!m_sound_only&&!m_sched[CPU_TGP].suspend){
+            const auto deadline=clock(m_base+tgp_quantum);
+            if(less(deadline,target))target=deadline;
+        }
+#endif
         if constexpr(SkipInert){
             // A guest may have inserted an earlier event. If all three
             // non-deferred clocks are short of a cycle at that deadline,
@@ -1506,7 +1808,7 @@ template<bool LazyAux,bool NarrowGap,bool Modular,bool FrameDivision,bool SkipIn
                 const auto &c=m_sched[id];
                 return std::bit_cast<int64_t>(target-uint64_t(c.local))<int64_t(uint64_t(c.period));
             };
-            if(new_head&&short_of_cycle(CPU_I960)&&short_of_cycle(CPU_TGP)&&short_of_cycle(CPU_Z80)){
+            if(new_head&&target==clock(initial_target)&&short_of_cycle(CPU_I960)&&short_of_cycle(CPU_TGP)&&short_of_cycle(CPU_Z80)){
                 m_base=initial_target;
                 break;
             }
@@ -1546,9 +1848,19 @@ template<bool LazyAux,bool NarrowGap,bool Modular,bool FrameDivision,bool SkipIn
 			int ran = cycles;
 			if (c.suspend == 0) {
 				SCHED_COUNT(++m_scheduler_diagnostics.active[id]);
-				if (id == CPU_Z80)
+				if (id == CPU_Z80) {
+#ifdef MODEL2_ORIGINAL
+                    if constexpr (Modular) {
+                        static const bool defer_io = std::getenv("DAYTONA_DEFER_CABINET_Z80") != nullptr;
+                        if (defer_io) m_original_io->schedule(cycles, c.cycles);
+                        else m_original_io->run(cycles, c.cycles);
+                    } else {
+                        m_original_io->run(cycles, c.cycles);
+                    }
+#else
 					ran = cycles + (cycles & 1);   // NOPs: two steps of 2 cycles
-				else {
+#endif
+				} else {
 					m_executing = id;
 					// the instruction hooks put on the CPUs only while one is set (each costs a call an instruction)
 					if constexpr(!Modular)if (id == CPU_I960 && bool(m_cpu.on_instruction) != bool(on_instruction))
@@ -1559,8 +1871,11 @@ template<bool LazyAux,bool NarrowGap,bool Modular,bool FrameDivision,bool SkipIn
 						static const bool sound_prof=getenv("VF2_SOUND_PROFILE")!=nullptr;
 						const uint64_t snd_t0=sound_prof?now_ns():0;
 						m_68k->set_total_base(c.cycles);
-						ran = m_68k->run(cycles);
-						if(sound_prof)m_sound_68k_ns+=now_ns()-snd_t0;
+						// Starvation probe: consume the cycles without executing,
+						// so the clock and timers stay exact but no bus traffic or
+						// interpreter work is produced.
+						ran = m_throttle_68k ? cycles : m_68k->run(cycles);
+						if(sound_prof){m_sound_68k_ns+=now_ns()-snd_t0;++m_sound_68k_runs;}
 					} else
 						ran = id == CPU_I960 ? m_cpu.run(cycles) : m_tgp->run(cycles);
 					// Complete partial command batches before timers can parse a frame.
@@ -1734,6 +2049,48 @@ bool model2a::modular_frame_ready()const
     return true;
 }
 
+namespace {
+struct timed_midi_frame {
+    uint64_t start;
+    std::vector<model2a::timed_midi_byte> *capture = nullptr;
+    std::span<const model2a::timed_midi_byte> incoming;
+};
+
+thread_local timed_midi_frame *midi_frame = nullptr;
+
+struct midi_frame_scope {
+    timed_midi_frame *previous;
+    explicit midi_frame_scope(timed_midi_frame &frame) : previous(midi_frame) { midi_frame = &frame; }
+    ~midi_frame_scope() { midi_frame = previous; }
+};
+}
+
+void model2a::run_frame_capturing_midi(std::vector<timed_midi_byte> &events)
+{
+    events.clear();
+    timed_midi_frame frame{uint64_t(m_base), &events, {}};
+    const midi_frame_scope scope(frame);
+    run_frame();
+}
+
+bool model2a::run_sound_frame(std::span<const timed_midi_byte> events)
+{
+    if (!m_sound_only || !m_sound_on || m_timer[T_UART].enabled || !m_snd_queue.empty())
+        return false;
+    const uint64_t duration = uint64_t(m_sched[CPU_I960].period) *
+        (CYCLES_PER_FRAME + (m_frame_number == 0 ? VBLANK_CYCLES : 0));
+    const auto timestamp = [](const timed_midi_byte &event) { return event.offset_attoseconds; };
+    if (!events.empty() && (timestamp(events.back()) > duration ||
+            !std::ranges::is_sorted(events, {}, timestamp)))
+        return false;
+    timed_midi_frame frame{uint64_t(m_base), nullptr, events};
+    const midi_frame_scope scope(frame);
+    if (!events.empty())
+        timer_adjust(T_UART, events.front().offset_attoseconds);
+    run_frame();
+    return frame.incoming.empty();
+}
+
 // Runs to the end of the frame's vblank, where MAME draws the screen.
 void model2a::run_frame()
 {
@@ -1755,6 +2112,9 @@ void model2a::run_frame()
 	}
 	m_modular_frame=modular_frame_ready();if(m_modular_frame)++m_modular_frames;
     while (m_frame_number == f) timeslice();
+#ifdef MODEL2_ORIGINAL
+    m_original_io->flush();
+#endif
     m_modular_frame=false;
 	advance_aux_clocks(m_base);
 	m_in1 = in_were[0]; m_in2 = in_were[1]; m_sw = sw_was;
@@ -1981,9 +2341,17 @@ u16 model2a::flags(offs_t a)
 }
 
 // Plain memory: P points at the byte (ROM set for the read-only ones); devices leave it null.
+#ifdef MODEL2_ORIGINAL
+#define MEM_2M(a, P, ROM) \
+	else if (a < 0x00220000) P = &m_ram200[a - 0x00200000]; \
+	else if (a < 0x00240000) { ROM = true; P = (u8 *)&m_rom[a - 0x00200000]; }
+#else
+#define MEM_2M(a, P, ROM) \
+	else if (a < 0x00240000) P = &m_ram200[a - 0x00200000];
+#endif
 #define MEM_CASES(a, P, ROM, TrackWrite)                                                                   \
 	if (a < 0x00200000) { ROM = true; P = (u8 *)&m_rom[a]; }                                   \
-	else if (a < 0x00240000) P = &m_ram200[a - 0x00200000];                                    \
+	MEM_2M(a, P, ROM)                                                                        \
 	else if (a >= 0x00500000 && a < 0x00600000) P = &m_workram[a - 0x00500000];                \
 	else if (a >= 0x00900000 && a < 0x00980000) {                                           \
         if(g_cooperative_fifo&&g_cooperative_batch>1&&!m_fifo_in.values.empty())service_cooperative_tgp(); \
@@ -1992,7 +2360,7 @@ u16 model2a::flags(offs_t a)
 	else if (a >= 0x00e00000 && a < 0x00e00038) P = &m_cpuctl[a - 0x00e00000];                 \
 	else if ((a & ~0x10000u) >= 0x01a00000 && (a & ~0x10000u) < 0x01a04000) P = &m_m2comm_share[a & 0x3fff]; \
 	else if (a >= 0x01d00000 && a < 0x01d04000) P = &m_backup[a - 0x01d00000];                 \
-	else if (a >= 0x02000000 && a < 0x04000000) { ROM = true; P = (u8 *)&m_data[a - 0x02000000]; } \
+	else if (a >= 0x02000000 && a < 0x04000000) { ROM = true; P = (u8 *)&m_data[fold_data(a - 0x02000000)]; } \
 	else if (a >= 0x06000000 && a < 0x07000000) { ROM = true; P = (u8 *)&m_data[a - 0x06000000 + 0x1000000]; }
 
 // The recompiled code's direct view of plain memory: each 4 KB page below 0x08000000 that is
@@ -2031,6 +2399,9 @@ u32 model2a::read_dword(offs_t a)
 	a &= ~3u;
 	if (g_fixed_fifo_load && a - 0x00884000u < 0x4000u)
 		return copro_fifo_r();
+	// No MEM_CASES range covers this device window.
+	if (g_fast_device_dword && a - 0x00800000u < 0x00100000u)
+		return dev_read(a, 0xffffffff);
 	u8 *p = nullptr; bool rom = false;
 	MEM_CASES(a, p, rom, false)
 	if (p) { u32 v; memcpy(&v, p, 4); return v; }
@@ -2062,6 +2433,10 @@ void model2a::write_dword(offs_t a, u32 v)
 	if (g_fixed_fifo_store && a - 0x00884000u < 0x4000u) {
 		if (on_copro) on_copro('w', a - 0x00880000, v);
 		copro_fifo_w(v);
+		return;
+	}
+	if (g_fast_device_dword && a - 0x00800000u < 0x00100000u) {
+		dev_write(a, v, 0xffffffff);
 		return;
 	}
 	u8 *p = nullptr; bool rom = false;
@@ -2185,6 +2560,14 @@ u32 model2a::dev_read(u32 a, u32 mem_mask)
 		if (mem_mask & 0x00ff0000) v |= u32(u8(m_m2comm_fg | 0x7e)) << 16;   // ~zfg << 7 with zfg 0: bit 7 set
 		return v;
 	}
+#ifdef MODEL2_ORIGINAL
+	if (a >= 0x01c00000 && a < 0x01c01000) {
+		const u32 offset = (a - 0x01c00000) >> 1;
+		m_original_io->flush();
+		return ((mem_mask & 0xff) ? m_original_io->shared[offset] : 0) |
+			((mem_mask & 0xff0000) ? u32(m_original_io->shared[offset + 1]) << 16 : 0);
+	}
+#else
 	if (a >= 0x01c00000 && a < 0x01c00020) {   // 315-5649, umask32 0x00ff00ff
 		const int o = int((a - 0x01c00000) >> 1);
 		u32 v = 0;
@@ -2192,6 +2575,7 @@ u32 model2a::dev_read(u32 a, u32 mem_mask)
 		if (mem_mask & 0x00ff0000) v |= u32(io_read(o + 1)) << 16;
 		return v;
 	}
+#endif
 	if (a == 0x01c80000) {   // i8251: data (lane 0), status (lane 2); VF2 never reads it
 		u32 v = 0;
 		if (mem_mask & 0x00ff0000) v |= u32(m_uart.status | 0x80) << 16;   // DSR
@@ -2331,6 +2715,15 @@ void model2a::dev_write(u32 a, u32 data, u32 mem_mask)
 		if (mem_mask & 0x00ff0000) m_m2comm_fg = (data >> 16) & 1;
 		return;
 	}
+#ifdef MODEL2_ORIGINAL
+	if (a >= 0x01c00000 && a < 0x01c01000) {
+		const u32 offset = (a - 0x01c00000) >> 1;
+		m_original_io->flush();
+		if (mem_mask & 0xff) m_original_io->shared[offset] = u8(data);
+		if (mem_mask & 0xff0000) m_original_io->shared[offset + 1] = u8(data >> 16);
+		return;
+	}
+#else
 	if (a >= 0x01c00000 && a < 0x01c00020) {
 		const int o = int((a - 0x01c00000) >> 1);
 		if (mem_mask & 0x000000ff) io_write(o, u8(data));
@@ -2338,6 +2731,7 @@ void model2a::dev_write(u32 a, u32 data, u32 mem_mask)
 		return;
 	}
 	if (a == 0x01c00040) return;   // nopw
+#endif
 	if (a == 0x01c80000) {
 		if (mem_mask & 0x000000ff) uart_write(0, u8(data));
 		if (mem_mask & 0x00ff0000) uart_write(1, u8(data >> 16));
@@ -3715,7 +4109,7 @@ void model2a::freecam_fighters()
 		const std::span<const u8> r = a >= 0x02000000 ? std::span<const u8>(m_data) : std::span<const u8>(m_rom);
 		const u32 o = a >= 0x02000000 ? a - 0x02000000 : a;
 		if (size_t(o) + 4 > r.size()) return 0;
-		u32 v; memcpy(&v, &r[o], 4); return v;
+		u32 v; memcpy(&v, &r[a >= 0x02000000 ? fold_data(o) : o], 4); return v;
 	};
 	std::vector<u32> obas[2];
 	for (int pl = 0; pl < 2; pl++) {
@@ -3798,7 +4192,7 @@ void model2a::read_panoramas()
 		for (int b = 0; b < 8; b++)
 			for (int y = 0; y < rows; y++)
 				for (int x = 0; x < 32; x++) {
-					const u8 *q = &m_data[p[b] - 0x02000000 + 2 * (y * 32 + x)];
+					const u8 *q = &m_data[fold_data(p[b] - 0x02000000) + 2 * (y * 32 + x)];
 					r.entries[size_t(y) * 256 + b * 32 + x] = u16(q[0] | q[1] << 8);
 				}
 		m_panoramas.push_back(std::move(r));
@@ -4128,11 +4522,24 @@ struct model2a::snd_bus : m68000_bus
 
 void model2a::sound_reset()
 {
+#ifdef MODEL2_ORIGINAL
+	m_68k.reset();
+	m_original_sound = std::make_unique<original_sound_board>(*this);
+	m_audio_out.clear();
+	m_sound_peak = 0;
+	m_68k = std::make_unique<m68000_device>(*m_original_sound, SOUND_CPU_CLOCK);
+	if (m_sound_only) m_68k->set_daytona_voice_ram(m_original_sound->verified_voice_scan_ram());
+	m_68k->start();
+	m_68k->reset();
+#else
 	m_soundram.assign(0x40000, 0);
 	// reset_model2_scsp: copy the 68k vector table into RAM (16 bytes; the regions hold the
 	// 68000's bytes in its own order, high byte first)
 	const std::vector<u8> &prog = m_roms.regions[romset::AUDIOCPU];
-	for (int i = 0; i < 8; i++) m_soundram[i] = u16(prog[2 * i] << 8 | prog[2 * i + 1]);
+	// A held board's program image may have been handed to the detached sound
+	// worker (it is that board's only reader), leaving this empty here.
+	if (prog.size() >= 16)
+		for (int i = 0; i < 8; i++) m_soundram[i] = u16(prog[2 * i] << 8 | prog[2 * i + 1]);
 	scsp_device::host h;
 	h.irq = [this](int line, int state) { set_input_line(L_68K_IRQ0 + (line & 7), state == CLEAR_LINE ? CLEAR_LINE : ASSERT_LINE); };
 	h.midi_out = [this](int state) { if (!state) m_midi_out_bits++; };   // to the UART's RxD (VF2 never reads it)
@@ -4163,6 +4570,7 @@ void model2a::sound_reset()
 	m_68k = std::make_unique<m68000_device>(*m_snd_bus, 45158400 / 4);
 	m_68k->start();
 	m_68k->reset();
+#endif
 }
 
 // Music or effects, for the host's two volumes. VF2's sound program starts each voice from one
@@ -4198,24 +4606,40 @@ void model2a::set_volumes(float music, float effects)
 
 void model2a::sound_update_tick()
 {
+#ifdef MODEL2_ORIGINAL
+	m_original_sound->update();
+#else
+	// Probe companion to set_throttle_68k: with the 68000 skipped and this on,
+	// the worker thread wakes and does nothing, which separates "the worker
+	// process exists" from "it is synthesising samples".
+	if (m_starve_scsp) return;
 	static const bool sound_prof=getenv("VF2_SOUND_PROFILE")!=nullptr;
 	const uint64_t snd_t0=sound_prof?now_ns():0;
 	m_scsp->update();
 	take_audio();
 	if(sound_prof){m_sound_scsp_ns+=now_ns()-snd_t0;++m_sound_scsp_updates;}
+#endif
 }
 
 // The samples the SCSP has made so far: to the host at the output gain (MVOL / 15), as 16-bit.
 // Above level 1 a peak limiter keeps them under -1 dBFS: down at once, back up over about 0.1 s.
 void model2a::take_audio()
 {
+#ifdef MODEL2_ORIGINAL
+	if (m_sound_on) m_original_sound->update();
+#else
 	std::vector<float> &o = m_scsp->m_out;
 	if (o.empty()) return;
-	const float g = m_scsp->output_gain();
+	// Host-side output gain. The board's own level (MVOL) leaves this stream at
+	// about -18 dBFS and the Mini's codec path is quiet, so the host can lift it
+	// (VF2_OUTPUT_GAIN; the launcher uses 4.0 = +12 dB). Above unity the peak
+	// limiter below always runs, so a boosted stream cannot hard clip.
+	static const float host_gain=[](){const char *p=std::getenv("VF2_OUTPUT_GAIN");const float v=p?float(std::atof(p)):1.0f;return v>0.0f?v:1.0f;}();
+	const float g = m_scsp->output_gain() * host_gain;
 	auto s16 = [](double v) { return int16_t(std::clamp(std::lround(v * 32768.0), -32768l, 32767l)); };
 	// Probe: the loudest sample this run produced, to prove the stream is not silence.
 	auto level = [&](int16_t s) { const int a = s < 0 ? -int(s) : int(s); if (a > m_sound_peak) m_sound_peak = a; };
-	if (m_sound_on && m_level == 1.0f)
+	if (m_sound_on && m_level == 1.0f && host_gain == 1.0f)
 		for (float v : o) { const int16_t s = s16(double(v) * g); level(s); m_audio_out.push_back(s); }
 	else if (m_sound_on) {
 		constexpr float CEILING = 0.891f, RELEASE = 1.0f / (0.1f * SOUND_RATE);
@@ -4232,9 +4656,22 @@ void model2a::take_audio()
 	}
 	if (m_keep_raw) m_audio_raw.insert(m_audio_raw.end(), o.begin(), o.end());
 	o.clear();
+#endif
 }
 
-void model2a::uart_txd(int state) { m_scsp->midi_in(state); }
+void model2a::uart_txd(int state)
+{
+	if (m_scsp) m_scsp->midi_in(state);
+}
+
+void model2a::receive_sound_byte(u8 data)
+{
+#ifdef MODEL2_ORIGINAL
+	m_original_sound->receive(data);
+#else
+	m_scsp->midi_in_byte(data);
+#endif
+}
 
 // A sound board alone (set_sound_only): the bytes it's given reach the SCSP's MIDI input a MIDI byte's time apart
 // (320 us), each at its own moment, on T_UART (no UART runs here), as the byte link delivers them on the game's
@@ -4255,8 +4692,18 @@ void model2a::sound_bytes(const uint8_t *b, size_t n)
 
 void model2a::snd_link_byte()
 {
+    if (midi_frame && !midi_frame->incoming.empty()) {
+        const auto event = midi_frame->incoming.front();
+        receive_sound_byte(event.value);
+        midi_frame->incoming = midi_frame->incoming.subspan(1);
+        if (midi_frame->incoming.empty())
+            timer_disable(T_UART);
+        else
+            timer_adjust(T_UART, midi_frame->incoming.front().offset_attoseconds - event.offset_attoseconds);
+        return;
+    }
 	if (m_snd_queue.empty()) { timer_disable(T_UART); return; }
-	m_scsp->midi_in_byte(m_snd_queue.front());
+	receive_sound_byte(m_snd_queue.front());
 	m_snd_queue.pop_front();
 	const atime gap = AS_PER_SEC / 1000000 * 320;
 	m_snd_next = time() + gap;
@@ -4420,8 +4867,10 @@ void model2a::link_event()
 {
 	uart8251 &u = m_uart;
 	if (u.tx_bits_left > 0 && !m_link_delivered) {   // the byte read at the sound board
-		m_link_delivered = true;
-		m_scsp->midi_in_byte(m_link_byte);
+        m_link_delivered = true;
+        if (midi_frame && midi_frame->capture)
+            midi_frame->capture->push_back({uint64_t(time()) - midi_frame->start, m_link_byte});
+        receive_sound_byte(m_link_byte);
 	} else {   // a step: after a byte's stop bit, or idle
 		u.tx_bits_left = 0;
 		m_link_in_step = true;

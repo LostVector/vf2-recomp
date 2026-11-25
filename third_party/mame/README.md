@@ -36,6 +36,11 @@ lines of the MAME files it comes from:
   and `model2_scsp`; the stream and timer behaviour of `emu/disound.cpp` (Aaron Giles, Olivier
   Galibert) and `emu/schedule.cpp`
 
+- `src/machine/model2_original.inc`: the Model 1 I/O board (`sega/model1io.cpp` and
+  `sega/315_5338a.cpp`, Dirk Best) and the ADC (`machine/msm6253.cpp`, AJR).
+- `src/machine/model1_sound.inc`: the Model 1 sound board's bus and wiring
+  (`shared/segam1audio.cpp`, R. Belmont).
+
 BSD-3-Clause: redistribution in source and binary form requires keeping the copyright notice,
 the list of conditions and the disclaimer; see https://opensource.org/license/bsd-3-clause. The
 packages carry them in LICENSES.txt (tools/release/licenses.sh).

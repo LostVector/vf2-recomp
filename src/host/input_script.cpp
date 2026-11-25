@@ -21,6 +21,15 @@ const button BUTTONS[] = {
 	{ "p2guard", input_script::IN2, 0x04 }, { "p2down", input_script::IN2, 0x10 },
 	{ "p2up", input_script::IN2, 0x20 }, { "p2right", input_script::IN2, 0x40 },
 	{ "p2left", input_script::IN2, 0x80 },
+#ifdef MODEL2_ORIGINAL
+	{ "view1", input_script::IN0, 0x20 }, { "view2", input_script::IN0, 0x40 },
+	{ "view3", input_script::IN0, 0x80 }, { "view4", input_script::IN1, 0x01 },
+	{ "steerleft", input_script::IN2, 0x01 }, { "steerright", input_script::IN2, 0x02 },
+	{ "accelerator", input_script::IN2, 0x04 }, { "brake", input_script::IN2, 0x08 },
+	{ "neutral", input_script::SW, 0x01 }, { "gear1", input_script::SW, 0x02 },
+	{ "gear2", input_script::SW, 0x04 }, { "gear3", input_script::SW, 0x08 },
+	{ "gear4", input_script::SW, 0x10 },
+#endif
 };
 
 // "start1+p1punch" or "in1:11" -> (port, mask) pairs

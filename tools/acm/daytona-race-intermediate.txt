@@ -1,0 +1,44 @@
+# Daytona USA circuit-select replay: Intermediate (中級, MEDIUM x4 laps), cold boot,
+# automatic transmission.
+#
+# The Circuit Select cursor tracks the STEERING WHEEL POSITION CONTINUOUSLY and wheel-center
+# = 初級 (Beginner), so releasing the steer snaps the cursor back to Beginner. The accelerator
+# confirm must land WHILE the wheel is held at the target course. A single steerright tap at
+# 415 moves to 中級; confirming at 420 (while the tap is still held) locks it in. Verified by
+# the in-race frame (LAP x4) and geometry hash 7fff27cbace3ff76 on a 1300-frame window.
+#
+# NOTE: the race-line steering below is Beginner-tuned, so the car leaves the racing line
+# after the first corner on Intermediate. Course SELECTION is correct and reproducible;
+# per-course race-line tuning is a follow-up.
+at 350
+press coin1 8
+at 380
+press start1 8
+at 415
+press steerright 6
+at 420
+press accelerator 12
+at 510
+press accelerator 12
+at 690
+hold accelerator
+at 1060
+press steerleft 26
+at 1200
+press steerright 26
+at 1350
+press brake 12
+at 2240
+press brake 20
+at 2500
+press steerleft 12
+at 2660
+press steerright 12
+at 2950
+press steerleft 12
+at 3230
+press steerright 18
+at 3450
+press brake 20
+at 3590
+press view2 8

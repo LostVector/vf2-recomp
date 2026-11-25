@@ -1,0 +1,29 @@
+# Daytona USA circuit-select replay: Expert (上級, LONG x2 laps), cold boot, automatic
+# transmission.
+#
+# The Circuit Select cursor tracks the STEERING WHEEL POSITION CONTINUOUSLY and wheel-center
+# = 初級 (Beginner), so releasing the steer snaps the cursor back to Beginner. The accelerator
+# confirm must land WHILE the wheel is held at the target course. Held steerright scrolls to
+# the bottom of the list (上級) and rests there; confirming at 424 while still holding locks
+# it in. Verified by the in-race frame (LAP x2) and geometry hash 05412860a8c95163 on a
+# 1300-frame window.
+#
+# Stay straight off the line, then steer left to keep clear of the right bridge rail.
+# The car then catches and passes opponents. Use frames 4900-6598 for the
+# 6600-frame traffic benchmark.
+at 350
+press coin1 8
+at 380
+press start1 8
+at 410
+hold steerright
+at 424
+press accelerator 12
+at 430
+release steerright
+at 510
+press accelerator 12
+at 690
+hold accelerator
+at 4440
+press steerleft 14

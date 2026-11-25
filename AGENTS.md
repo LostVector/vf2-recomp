@@ -4,3 +4,4 @@
 - State the hypothesis, measurement, and decision criterion in one sentence. Run the smallest useful check with the existing harness. Reviewing logs and preparing commands do not count as running an experiment.
 - Verify the recorded device command, binary, and flags before interpreting timings. Record the command, result, and decision on disk.
 - Run hardware jobs one at a time. Restore and verify the interactive release afterward. Screen changes with the short Dural replay and qualify repeatable gains with the full replay.
+- Re-evaluate priorities with an independent agent every 4 hours, not every hour (user update, 2026-11-20).

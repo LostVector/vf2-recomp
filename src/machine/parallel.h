@@ -5,7 +5,9 @@
 #endif
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdlib>
 #include <functional>
 #include <mutex>
@@ -21,6 +23,18 @@ class row_pool
 public:
 	static row_pool &get() { static row_pool p; return p; }
 	int threads() const { return int(m_workers.size()) + 1; }
+	class lock_wait_sample {
+	public:
+		explicit lock_wait_sample(int64_t *total) : previous(t_lock_wait_ns)
+		{
+			if (total) t_lock_wait_ns = total;
+		}
+		~lock_wait_sample() { t_lock_wait_ns = previous; }
+		lock_wait_sample(const lock_wait_sample &) = delete;
+		lock_wait_sample &operator=(const lock_wait_sample &) = delete;
+	private:
+		int64_t *previous;
+	};
 #if defined(__ANDROID__)
 	// The workers' ids as the kernel knows them, with this thread's first: the threads a frame's
 	// drawing runs on, which is what Android's performance hints (a session, ADPF) are asked over.
@@ -48,7 +62,11 @@ public:
 		// inside a band (a worker's, or this thread's mid-run): no pool to hand it to, so here
 		if ((n < 2 * t && !tasks) || n < 2 || t == 1 || t_in_pool) { f(0, n); return; }
 		// one caller at a time (another thread drawing at once would share the counters)
+		using clock = std::chrono::steady_clock;
+		const auto wait_started = t_lock_wait_ns ? clock::now() : clock::time_point{};
 		std::lock_guard<std::mutex> one(m_run_mu);
+		if (t_lock_wait_ns)
+			*t_lock_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - wait_started).count();
 		struct in_pool { in_pool() { t_in_pool = true; } ~in_pool() { t_in_pool = false; } } mark;
 		const int parts = tasks ? n : std::min(n, t * std::max(1, per_thread));
 		{
@@ -57,13 +75,19 @@ public:
 			m_n = n;
 			m_parts = parts;
 			m_next.store(0, std::memory_order_relaxed);
-			m_left = t - 1;             // the workers still to finish
+			m_left.store(t - 1, std::memory_order_relaxed);   // the workers still to finish
 			m_gen++;
 		}
 		m_cv.notify_all();
 		take_bands(f, n, parts);
+		// Phases arrive in bursts a few milliseconds apart. A bounded spin on the
+		// join counter avoids a sleep/wake round trip on the render thread; the
+		// counter is atomic, so this runs without the lock (which the workers
+		// need to take their decrement).
+		if (const int spin_us = join_spin_us(); spin_us > 0)
+			spin_until([&] { return m_left.load(std::memory_order_acquire) == 0; }, spin_us);
 		std::unique_lock<std::mutex> l(m_mu);
-		m_done.wait(l, [&] { return m_left == 0; });
+		m_done.wait(l, [&] { return m_left.load(std::memory_order_acquire) == 0; });
 		m_job = nullptr;
 	}
 
@@ -71,12 +95,42 @@ private:
 	std::vector<std::thread> m_workers;
 	std::mutex m_mu, m_run_mu;
 	static inline thread_local bool t_in_pool = false;
+	static inline thread_local int64_t *t_lock_wait_ns = nullptr;
 	std::condition_variable m_cv, m_done;
 	const std::function<void(int, int)> *m_job = nullptr;
-	int m_n = 0, m_parts = 0, m_left = 0;
+	int m_n = 0, m_parts = 0;
+	std::atomic<int> m_left{0};
 	std::atomic<unsigned> m_next{0};
 	unsigned m_gen = 0;
-	bool m_quit = false;
+	std::atomic<bool> m_quit{false};
+
+	// A bounded spin on the join counter instead of parking the render thread
+	// for the last band. Phases within a frame finish a few hundred
+	// microseconds apart, and a condvar wake there costs ~1 ms; the condvar
+	// remains the fallback when the spin expires. Spin only in the caller:
+	// workers that spin were measured to starve the render and sound threads
+	// (audio underruns), so they keep parking as before.
+	static int join_spin_us()
+	{
+		static const int us = [] {
+			const char *v = std::getenv("VF2_POOL_JOIN_SPIN_US");
+			return v ? std::max(0, std::atoi(v)) : 800;
+		}();
+		return us;
+	}
+	static inline void cpu_pause()
+	{
+#if defined(__arm__) || defined(__aarch64__)
+		__asm__ __volatile__("yield");
+#else
+		std::this_thread::yield();
+#endif
+	}
+	template<class Done> static void spin_until(Done done, int us)
+	{
+		const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
+		while (!done() && std::chrono::steady_clock::now() < until) cpu_pause();
+	}
 
 	static std::pair<int, int> band(int i, int n, int parts) { return { n * i / parts, n * (i + 1) / parts }; }
 
@@ -120,8 +174,8 @@ private:
 				unsigned seen = 0;
 				for (;;) {
 					std::unique_lock<std::mutex> l(m_mu);
-					m_cv.wait(l, [&] { return m_quit || m_gen != seen; });
-					if (m_quit) return;
+					m_cv.wait(l, [&] { return m_quit.load(std::memory_order_relaxed) || m_gen != seen; });
+					if (m_quit.load(std::memory_order_relaxed)) return;
 					seen = m_gen;
 					const auto *job = m_job;
 					const int n = m_n, parts = m_parts;
@@ -130,13 +184,13 @@ private:
 					take_bands(*job, n, parts);
 					t_in_pool = false;
 					l.lock();
-					if (--m_left == 0) m_done.notify_one();
+					if (m_left.fetch_sub(1, std::memory_order_acq_rel) == 1) m_done.notify_one();
 				}
 			});
 	}
 	~row_pool()
 	{
-		{ std::lock_guard<std::mutex> l(m_mu); m_quit = true; }
+		{ std::lock_guard<std::mutex> l(m_mu); m_quit.store(true); }
 		m_cv.notify_all();
 		for (auto &w : m_workers) w.join();
 	}

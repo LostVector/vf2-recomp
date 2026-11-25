@@ -18,8 +18,13 @@ private:
     double cpu_start=0;
     static double cpu(){timespec t{};clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t);return t.tv_sec*1000.+t.tv_nsec/1e6;}
 public:
-    void begin(){if(enabled){wall_start=clock::now();cpu_start=cpu();}}
-    void mark(stage s){if(!enabled)return;auto now=clock::now();double c=cpu();auto &t=totals[s];t.wall+=std::chrono::duration<double,std::milli>(now-wall_start).count();t.cpu+=c-cpu_start;++t.calls;wall_start=now;cpu_start=c;}
+    // Wall ms of each stage for the frame being built, for the per-frame trace.
+    double frame[count]{};
+    // Thread CPU for the same stages: a stage that is mostly wall but not CPU
+    // is the thread waiting or being preempted, not doing work.
+    double frame_cpu[count]{};
+    void begin(){if(!enabled)return;for(auto &v:frame)v=0;for(auto &v:frame_cpu)v=0;wall_start=clock::now();cpu_start=cpu();}
+    void mark(stage s){if(!enabled)return;auto now=clock::now();double c=cpu();const double wall=std::chrono::duration<double,std::milli>(now-wall_start).count();auto &t=totals[s];t.wall+=wall;t.cpu+=c-cpu_start;++t.calls;frame[s]=wall;frame_cpu[s]=c-cpu_start;wall_start=now;cpu_start=c;}
     void fence(unsigned phase,int state){if(enabled&&phase<3&&state>=-1&&state<=1)++fences[phase][state+1];}
     void report(unsigned long long frames)const{
         if(!enabled)return;

@@ -17,6 +17,7 @@
 #include <atomic>
 #include <array>
 #include <bit>
+#include <bitset>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -24,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -43,7 +45,7 @@ const char *vertex_source=R"(
 attribute vec2 aPosition;
 attribute vec3 aQ;
 uniform vec2 uSize;
-uniform float uScale;
+uniform vec2 uScale;
 uniform highp float uSortDepth;
 uniform VF2_PREC vec4 uTexture;
 uniform highp vec2 uUVBase;
@@ -184,7 +186,7 @@ void main() {
     gl_FragColor=uOwnerMode>0.5?uOwner:colour;
 }
 )";
-GLuint shader(GLenum type,const char *body,bool highp,bool low_coordinates,bool mesh=false,unsigned batch_mode=0) {
+GLuint shader(GLenum type,const char *body,bool highp,bool low_coordinates,bool mesh=false,unsigned batch_mode=0,bool compact_meta=false) {
     GLuint s=glCreateShader(type);
     std::string prefix=highp?"#define VF2_PREC highp\n":"#define VF2_PREC mediump\n";
     prefix+=low_coordinates?"#define VF2_LOW_PREC 1\n":"#define VF2_LOW_PREC 0\n";
@@ -192,6 +194,7 @@ GLuint shader(GLenum type,const char *body,bool highp,bool low_coordinates,bool 
     if(std::getenv("VF2_GLES_INTERPOLATOR_HIGHP"))prefix+="#define VF2_VARY_PREC highp\n";
     else prefix+=std::getenv("VF2_GLES_MEDIUMP_VARYINGS")?"#define VF2_VARY_PREC mediump\n":"#define VF2_VARY_PREC VF2_PREC\n";
     prefix+="#define VF2_BATCH_MODE "+std::to_string(batch_mode)+"\n";
+    if(compact_meta)prefix+="#define VF2_PROBE_COMPACT_META 1\n";
     if(mesh)prefix+="#define VF2_MESH_VERTEX 1\n";
     prefix+=wide_palette_atlas?"#define VF2_PALETTE_X_RANGE 1024.0\n":"#define VF2_PALETTE_X_RANGE 512.0\n";
     const char *sources[]={prefix.c_str(),body};
@@ -220,6 +223,8 @@ class gles2 final:public gpu3d {
     GLuint tile_ibo=0;
     const bool client_arrays=std::getenv("VF2_CLIENT_ARRAYS")!=nullptr;
     const bool mesh_render=std::getenv("VF2_MESH_RENDER")!=nullptr;
+    const bool compact_meta=std::getenv("DAYTONA_COMPACT40")&&!mesh_render&&
+        !std::getenv("VF2_DRAW_STREAM_HASH")&&!std::getenv("VF2_CHECK_DIRECT_PACK");
     const bool specialize_batches=std::getenv("VF2_HOMOGENEOUS_ATLAS_SHADERS")&&!mesh_render&&
         !std::getenv("VF2_FLAT_FRAGMENT_PROBE");
     GLint mesh_rows_location=-1;
@@ -239,8 +244,39 @@ class gles2 final:public gpu3d {
     };
     static_assert(sizeof(batch_material)==24 && sizeof(batch_vertex)==52);
     static_assert(offsetof(batch_vertex,material)==28);
+    struct compact_material {
+        float depth;
+        int16_t texlod;
+        uint16_t palette_flags;
+        uint8_t mip;
+        uint8_t colour[3];
+    };
+    struct compact_vertex {
+        float position_q[3],uv0[2],uv1[2];
+        compact_material material;
+    };
+    static_assert(sizeof(compact_vertex)==40 && offsetof(compact_vertex,material)==28);
+    static bool can_compact(const batch_material &m){
+        return m.info0[0]<=1&&m.info0[1]<=1&&m.info0[2]<=1&&!m.info0[3]&&
+            m.palette[0]<=768&&m.palette[0]%256==0&&m.palette[1]<1024&&
+            m.info1[1]>=-1&&m.info1[1]<=14&&m.info1[2]>=0&&m.info1[2]<=2&&
+            m.info1[3]>=0&&m.info1[3]<=3&&m.colour[3]==255;
+    }
+    static compact_material compact(const batch_material &m){
+        const unsigned flags=m.info0[0]+2*m.info0[1]+4*m.info0[2];
+        return {m.depth,m.info1[0],uint16_t(m.palette[0]*4+m.palette[1]+4096*flags),
+            uint8_t(m.info1[1]+1+16*m.info1[2]+64*m.info1[3]),
+            {m.colour[0],m.colour[1],m.colour[2]}};
+    }
     std::vector<batch_vertex> batch_vertices;
+    std::vector<compact_vertex> compact_vertices;
+    bool compact_ready=false;
+    size_t compact_frames=0,wide_fallback_frames=0;
+    const bool test_compact_fallback=std::getenv("DAYTONA_COMPACT40_TEST_FALLBACK")!=nullptr;
     std::vector<uint16_t> batch_indices;
+    // The vectors keep their high-water capacity so growth never re-zeroes
+    // elements the pack will overwrite; these track the live span each frame.
+    size_t batch_vertex_count=0,batch_index_count=0;
     struct batch_bucket {std::vector<batch_vertex> vertices;std::vector<uint32_t> indices;};
     std::unordered_map<uint64_t,batch_bucket,vf2_batch::tile_hash> batch_buckets;
     struct direct_bucket {size_t vertices=0,indices=0,first_vertex=0,first_index=0;unsigned features=0;};
@@ -253,7 +289,7 @@ class gles2 final:public gpu3d {
         const vf2_tiles::retained_fan *fan=nullptr;
         const uint32_t *indices=nullptr;
         batch_material material{};
-        std::array<float,8> map{};
+        size_t map_slot=0;
         unsigned texw=0,texh=0;
         bool power_of_two=false;
 
@@ -274,6 +310,7 @@ class gles2 final:public gpu3d {
         std::vector<uint32_t> flat_indices;
     };
     std::vector<direct_work> direct_jobs;
+    std::vector<std::array<float,8>> draw_maps;
     background_job pack_worker;
     struct batch_draw {unsigned page_a,page_b,first,count,mesh_group=0;};
     std::vector<batch_draw> batch_draws;
@@ -298,7 +335,17 @@ class gles2 final:public gpu3d {
     struct texture_material {
         uint16_t texw,texh,texx,texy,utexx,utexy;
         uint8_t sheet,renderer,wrapx,wrapy,utex;
+        bool operator==(const texture_material &) const = default;
     };
+    struct atlas_pair_entry {
+        texture_material texture;
+        int8_t band,max_level;
+        bool native_repeat;
+        size_t map_slot;
+        uint64_t page_key;
+        direct_bucket *cached_bucket=nullptr;
+    };
+    std::vector<atlas_pair_entry> atlas_pair_cache;
     struct prepared_draw {
         draw_work work;
         texture_material texture;
@@ -347,12 +394,16 @@ class gles2 final:public gpu3d {
         size_t spare_bytes=0;
         bool supported=true;
         unsigned retained=0;
+        unsigned sampleless=0;
     };
     std::vector<prepared_draw_range> prepared_draws;
     bool draw_lists_ready=false;
     uint64_t retained_fans=0;
     uint64_t prepared_draw_frames=0,prepared_draw_jobs=0;
     uint64_t ordinary_cell_vertices=0,full_cell_vertices=0;
+    uint64_t sampleless_polygons=0;
+    GLint raster_subpixel_bits=0;
+    const bool cull_sampleless=std::getenv("VF2_CULL_SAMPLELESS_BOUNDS")!=nullptr;
     const bool compact_cell_vertices=std::getenv("VF2_COMPACT_CELL_VERTICES")!=nullptr;
     const bool keep_inactive_slots=std::getenv("VF2_KEEP_INACTIVE_PACKET_SLOTS")!=nullptr;
     const bool fused_uv_bounds=std::getenv("VF2_FUSED_UV_BOUNDS")!=nullptr;
@@ -382,9 +433,8 @@ class gles2 final:public gpu3d {
         GLuint name=0;
         GLint size,scale,height,owners,atlas_a,atlas_b,palette;
         int configured_width=0,configured_height=0,configured_owner=-1;
-        float configured_scale=0;
     };
-    std::array<batch_program,4> batch_programs{};
+    std::array<batch_program,4> batch_programs{},compact_programs{};
     std::unordered_map<uint64_t,GLuint,material_hash> tiles;
     size_t tile_bytes=0;
     uint64_t tile_hits=0,tile_misses=0,tile_uploads=0,tile_clears=0,draw_calls=0,submitted_vertices=0,painted_frames=0;
@@ -447,7 +497,7 @@ class gles2 final:public gpu3d {
     const bool profile_packet_phases=std::getenv("VF2_PACKET_PHASES")!=nullptr;
     bool timing_packets=false;
     double current_pack_ms=0;
-    std::vector<std::array<double,3>> packet_phases;
+    std::vector<std::array<double,4>> packet_phases;
     static double phase_ms(clock::time_point start,clock::time_point end){
         return std::chrono::duration<double,std::milli>(end-start).count();
     }
@@ -654,24 +704,64 @@ class gles2 final:public gpu3d {
                              const auto &p,int x0,int y0,int x1,int y1,int scale)
     {
         vertices.clear();indices.clear();
-        std::vector<vf2_tiles::point> polygon;
-        for(int i=0;i<p.n;++i){
-            if constexpr(std::is_same_v<std::decay_t<decltype(p)>,gpu3d_poly>)
-                polygon.push_back({p.x[i],p.y[i],1,0,0});
-            else polygon.push_back({p.points[i].x,p.points[i].y,1,0,0});
-        }
-        polygon=vf2_tiles::clip(std::move(polygon),[&](const auto &v){return double(v.x)-double(x0)/scale;});
-        polygon=vf2_tiles::clip(std::move(polygon),[&](const auto &v){return double(x1)/scale-v.x;});
-        polygon=vf2_tiles::clip(std::move(polygon),[&](const auto &v){return double(v.y)-double(y0)/scale;});
-        polygon=vf2_tiles::clip(std::move(polygon),[&](const auto &v){return double(y1)/scale-v.y;});
-        if(frame_indexed&&polygon.size()>=3){
-            for(const auto &point:polygon){vf2_tiles::vertex v{};v.p=point;vertices.push_back(v);}
-            for(size_t i=1;i+1<polygon.size();++i)indices.insert(indices.end(),{0,uint32_t(i),uint32_t(i+1)});
-        }else if(!frame_indexed){
-            for(size_t i=1;i+1<polygon.size();++i)for(const auto &point:{polygon[0],polygon[i],polygon[i+1]}){
-                vf2_tiles::vertex v{};v.p=point;vertices.push_back(v);
+        const double left = double(x0) / scale, right = double(x1) / scale;
+        const double top = double(y0) / scale, bottom = double(y1) / scale;
+        const auto point_at = [&](int i) -> vf2_tiles::point {
+            if constexpr (std::is_same_v<std::decay_t<decltype(p)>, gpu3d_poly>)
+                return {p.x[i], p.y[i], 1, 0, 0};
+            else
+                return {p.points[i].x, p.points[i].y, 1, 0, 0};
+        };
+        const auto emit = [&](const auto &polygon) {
+            if (frame_indexed && polygon.size() >= 3) {
+                for (const auto &point : polygon) {
+                    vf2_tiles::vertex v{};
+                    v.p = point;
+                    vertices.push_back(v);
+                }
+                for (size_t i = 1; i + 1 < polygon.size(); ++i)
+                    indices.insert(indices.end(), {0, uint32_t(i), uint32_t(i+1)});
+            } else if (!frame_indexed) {
+                for (size_t i = 1; i + 1 < polygon.size(); ++i)
+                    for (const auto &point : {polygon[0], polygon[i], polygon[i+1]}) {
+                        vf2_tiles::vertex v{};
+                        v.p = point;
+                        vertices.push_back(v);
+                    }
             }
+        };
+#ifdef MODEL2_ORIGINAL
+        static const bool stack_clipping = std::getenv("DAYTONA_STACK_FLAT_CLIP") != nullptr;
+        if (stack_clipping && p.n >= 3 && p.n <= 8) {
+            std::array<vf2_tiles::point, 8> points;
+            bool inside = true;
+            for (int i = 0; i < p.n; ++i) {
+                const auto pt = point_at(i);
+                points[i] = pt;
+                inside &= pt.x >= left && pt.x <= right && pt.y >= top && pt.y <= bottom;
+            }
+            if (inside) {
+                emit(std::span<const vf2_tiles::point>(points.data(), p.n));
+                return;
+            }
+            vf2_tiles::stack_polygon polygon;
+            polygon.borrow(points.data(), p.n);
+            polygon.clip_by([&](const auto &v) { return double(v.x) - left; });
+            polygon.clip_by([&](const auto &v) { return right - v.x; });
+            polygon.clip_by([&](const auto &v) { return double(v.y) - top; });
+            polygon.clip_by([&](const auto &v) { return bottom - v.y; });
+            emit(polygon);
+            return;
         }
+#endif
+        std::vector<vf2_tiles::point> polygon;
+        for (int i = 0; i < p.n; ++i)
+            polygon.push_back(point_at(i));
+        polygon = vf2_tiles::clip(std::move(polygon), [&](const auto &v) { return double(v.x) - left; });
+        polygon = vf2_tiles::clip(std::move(polygon), [&](const auto &v) { return right - v.x; });
+        polygon = vf2_tiles::clip(std::move(polygon), [&](const auto &v) { return double(v.y) - top; });
+        polygon = vf2_tiles::clip(std::move(polygon), [&](const auto &v) { return bottom - v.y; });
+        emit(polygon);
     }
 
     static void bind_shared_packet(const prepared_draw_range &range,size_t at,draw_work &work){
@@ -713,14 +803,80 @@ class gles2 final:public gpu3d {
                      (unsigned long long)hash,(unsigned long long)(indices/3));
     }
 
+    unsigned uniform_mip_axes(const gpu3d_projected_poly &p,int level)const{
+        const unsigned w=p.texw>>level,h=p.texh>>level;
+        if(!w||!h||w>4||h>4)return 0;
+        const unsigned x=((unsigned(p.texx)-2048)>>level)&2047;
+        const unsigned y=((unsigned(p.texy)-1024)>>level)&1023;
+        const auto *sheet=rams.tex[p.sheet^(level&1)];
+        unsigned axes=3, texels[4][4]{};
+        for(unsigned v=0;v<h;++v)for(unsigned u=0;u<w;++u){
+            const unsigned px=(x+u)&2047,py=(y+v)&1023;
+            const unsigned half=px>=1024?1024:0;
+            const unsigned xo=(px-half)>>1;
+            const unsigned address=((((py>>1)<<9)^(half<<8))|xo)>>1;
+            const unsigned shift=((xo&1)<<4)+((~u&1)<<2)+((~v&1)<<3);
+            const unsigned index=(sheet[address&0x7ffff]>>shift)&15;
+            texels[v][u]=index;
+            if(index!=texels[v][0])axes&=~1u;
+            if(index!=texels[0][u])axes&=~2u;
+        }
+        return axes;
+    }
+
+    template<bool Narrow=false>
+    static bool lacks_sample_centers(const gpu3d_projected_poly &p,int left,int top,int right,int bottom){
+        float min_x=INFINITY,min_y=INFINITY,max_x=-INFINITY,max_y=-INFINITY;
+        float min_q=INFINITY,max_q=0.f;
+        for(unsigned i=0;i<p.n;++i){
+            const auto &v=p.points[i];
+            if(!(v.x>=left&&v.x<=right&&v.y>=top&&v.y<=bottom&&v.q>0&&v.q<INFINITY))return false;
+            min_x=std::min(min_x,v.x);min_y=std::min(min_y,v.y);
+            max_x=std::max(max_x,v.x);max_y=std::max(max_y,v.y);
+            if constexpr(Narrow){
+                min_q=std::min(min_q,v.q);
+                max_q=std::max(max_q,v.q);
+            }
+        }
+        // Keep a margin for screen-coordinate and raster subpixel rounding.
+        const auto no_center=[](float lo,float hi,double margin){
+            return hi-lo<1-2*margin&&
+                std::ceil(double(lo)-0.5-margin)>std::floor(double(hi)-0.5+margin);
+        };
+        if constexpr(Narrow){
+            // The tighter margin is for in-viewport polygons with bounded
+            // reciprocal depth and limited perspective variation.
+            if(min_q>=0x1p-24f&&max_q<=1.f&&max_q<=4.f*min_q)
+                return no_center(min_x,max_x,0.125)||no_center(min_y,max_y,0.125);
+        }
+        return no_center(min_x,max_x,0.25)||no_center(min_y,max_y,0.25);
+    }
+    bool sampleless_pairs_current(const gpu3d_projected_poly &p,int max_level)const{
+        // Workers only read atlas slots here. First touches or generation
+        // changes must still run normal planning to preserve later placement.
+        bool ready=true;
+        vf2_tiles::visit_indexed_bands(p,max_level,limited_mip_scan,[&](int band,double,double){
+            if(ready)ready=batch_atlas.pair_current(rams,p,band,max_level,
+                vf2_tiles::native_repeat_material(p,band));
+        });
+        return ready;
+    }
+
     void prepare_shared_projected(const gpu3d_projected_poly *polys,size_t count,
                                   const gpu3d_frame &f,bool *palettes_ready){
         batch_packets.clear();
         shared_packets_active=true;
-        const int chunks=std::max(1,std::min(int(count),row_pool::get().threads()*4));
+        const int chunks=std::max(1,std::min(int(count),row_pool::get().threads()*16));
         const int palette_task=palettes_ready?1:0;
         prepared_draws.resize(chunks);
         static const bool test_viewport_bounds=std::getenv("VF2_FAST_VIEWPORT_BOUNDS")!=nullptr;
+        static const bool collapse_uniform=std::getenv("VF2_CONSTANT_MIP_MERGE")!=nullptr;
+        static const bool share_envelope=std::getenv("DAYTONA_REUSE_FAN_ENVELOPE")&&
+            !std::getenv("VF2_CLIP_FLOAT_ALL");
+        const bool atlas_uniform=batch_atlas.records_uniform_axes();
+        // Pixel-center rejection assumes the single-sample targets from make_targets.
+        const bool screen_cull=cull_sampleless&&raster_subpixel_bits>=4&&f.scale==1&&width==496&&height==384;
+        static const bool narrow_sampleless=std::getenv("DAYTONA_NARROW_SAMPLELESS")!=nullptr;
         parallel_tasks(chunks+palette_task,[&](int task){
             if(palettes_ready&&task==0){
                 *palettes_ready=prepare_palettes(polys,count,staged_rows,false);
@@ -728,7 +884,7 @@ class gles2 final:public gpu3d {
             }
             const int chunk=task-palette_task;
             auto &r=prepared_draws[chunk];
-            r.draws.clear();r.locations.clear();r.fans.clear();r.storage.clear();r.retained=0;r.supported=true;
+            r.draws.clear();r.locations.clear();r.fans.clear();r.storage.clear();r.retained=0;r.sampleless=0;r.supported=true;
             for(size_t at=count*chunk/chunks;at<count*(chunk+1)/chunks;++at){
                 const auto &p=polys[at];
                 const bool textured=p.renderer&2;
@@ -737,6 +893,13 @@ class gles2 final:public gpu3d {
                 const int x0=std::max(0,int(p.vp[0])*f.scale),x1=std::min(width,(int(p.vp[1])+1)*f.scale);
                 const int y0=std::max(0,int(p.vp[2])*f.scale),y1=std::min(height,(int(p.vp[3])+1)*f.scale);
                 if(x1<=x0||y1<=y0)continue;
+                const int max=textured?max_texture_mip(p):0;
+                if(screen_cull&&textured&&
+                    (narrow_sampleless?lacks_sample_centers<true>(p,x0,y0,x1,y1):lacks_sample_centers(p,x0,y0,x1,y1))&&
+                    sampleless_pairs_current(p,max)){
+                    ++r.sampleless;
+                    continue;
+                }
                 const auto append=[&](const vf2_tiles::packet_writer &packet,texture_material material,int band,int max){
                     auto &draw=r.draws.emplace_back(at,count,material,p,band,max);
                     const bool ordinary=packet.ordinary.size()!=0;
@@ -753,25 +916,37 @@ class gles2 final:public gpu3d {
                     append(packet,material,-1,0);
                     continue;
                 }
-                const int max=max_texture_mip(p);
                 const texture_material material{p.texw,p.texh,p.texx,p.texy,p.utexx,p.utexy,
                     p.sheet,p.renderer,p.wrapx,p.wrapy,p.utex};
                 const float left=float(x0)/f.scale,top=float(y0)/f.scale,right=float(x1)/f.scale,bottom=float(y1)/f.scale;
+                int uncut_band=-2;
                 vf2_tiles::retained_fan fan;
                 if(vf2_tiles::retain_fan(fan,p,max,left,top,right,bottom,indexed_texture_cells,
-                                         retained_cell_bounds,fused_uv_bounds)){
+                                         retained_cell_bounds,fused_uv_bounds,share_envelope?&uncut_band:nullptr)){
                     auto &draw=r.draws.emplace_back(at,count,material,p,fan.band,max);
                     draw.work.n=fan.n;
                     draw.work.ni=fan.index_count();
                     r.locations.push_back({r.fans.size(),0,packet_location::fan});
                     r.fans.push_back(fan);
                     ++r.retained;
-                }else vf2_tiles::visit_indexed_bands(p,max,limited_mip_scan,[&](int band,double lower,double upper){
+                    continue;
+                }
+                const auto emit=[&](int band,double lower,double upper,bool outer_kept=false){
                     vf2_tiles::packet_writer packet(r.storage);
+                    unsigned uniform_axes=0;
+                    if((collapse_uniform||atlas_uniform)&&band>=0&&p.renderer==2){
+                        const auto uniform=[&](int level){
+                            return atlas_uniform?batch_atlas.current_uniform_axes(rams,p,level):uniform_mip_axes(p,level);
+                        };
+                        uniform_axes=uniform(band);
+                        if(uniform_axes&&band!=max)uniform_axes&=uniform(band+1);
+                    }
                     vf2_tiles::clip_indexed_band<true>(packet,p,band,max,left,top,right,bottom,lower,upper,
-                        origin_packet_fan,indexed_texture_cells,compact_cell_vertices,test_viewport_bounds);
+                        origin_packet_fan,indexed_texture_cells,compact_cell_vertices,test_viewport_bounds,uniform_axes,outer_kept);
                     if(packet.indices.size())append(packet,material,band,max);
-                });
+                };
+                if(uncut_band>=-1)emit(uncut_band,0,INFINITY,true);
+                else vf2_tiles::visit_indexed_bands(p,max,limited_mip_scan,emit);
             }
         });
         draw_lists_ready=std::all_of(prepared_draws.begin(),prepared_draws.end(),
@@ -780,6 +955,7 @@ class gles2 final:public gpu3d {
         size_t spare=0;
         for(const auto &r:prepared_draws){
             retained_fans+=r.retained;
+            sampleless_polygons+=r.sampleless;
             spare+=r.storage.spare_bytes()+(r.fans.capacity()-r.fans.size())*sizeof(vf2_tiles::retained_fan);
         }
         if(packet_trim_test)packet_trim_checksum=packet_trim_checksum*31+spare;
@@ -915,7 +1091,7 @@ class gles2 final:public gpu3d {
         if(palettes_ready||draw_lists_ready){
             // Both job types read the same immutable snapshot. Polygon
             // chunks stay in source order even when workers finish out of order.
-            const int chunks=std::max(1,std::min(int(count),row_pool::get().threads()*4));
+            const int chunks=std::max(1,std::min(int(count),row_pool::get().threads()*16));
             if(draw_lists_ready)prepared_draws.resize(chunks);
             const int palette_task=palettes_ready?1:0;
             parallel_tasks(chunks+palette_task,[&](int task){
@@ -1053,12 +1229,12 @@ class gles2 final:public gpu3d {
                     const auto &vertices=indexed?indexed->vertices:prepared.bands[band+1];
                     if(indexed?!indexed->vertex_count():vertices.empty())continue;
                     const bool native_repeat=indexed&&indexed->native_repeat;
-                    const auto [a,b]=batch_atlas.get_pair(rams,p,band,max_level,native_repeat);
-                    if(!a||!b)return false;
+                    vf2_batch::tile a,b;
+                    if(!batch_atlas.get_pair(rams,p,band,max_level,native_repeat,a,b))return false;
                     material.info1[1]=band;material.info1[2]=band<0?(p.utex?2:0):(band<max_level?1:0);
-                    std::array<float,8> map={a->transform[0],a->transform[1],a->transform[2],a->transform[3],
-                        b->transform[0],b->transform[1],b->transform[2],b->transform[3]};
-                    const uint64_t key=(uint64_t(a->page)<<32)|b->page;
+                    std::array<float,8> map={a.transform[0],a.transform[1],a.transform[2],a.transform[3],
+                        b.transform[0],b.transform[1],b.transform[2],b.transform[3]};
+                    const uint64_t key=(uint64_t(a.page)<<32)|b.page;
                     auto &group=batch_buckets[key];auto &bucket=group.vertices;
                     const size_t first=bucket.size();
                     if(indexed&&!indexed->ordinary.empty()){
@@ -1099,6 +1275,7 @@ class gles2 final:public gpu3d {
             }else batch_draws.push_back({unsigned(bucket.first>>32),unsigned(bucket.first),unsigned(batch_vertices.size()),unsigned(vertices.size())});
             batch_vertices.insert(batch_vertices.end(),vertices.begin(),vertices.end());
         }
+        batch_vertex_count=batch_vertices.size();batch_index_count=batch_indices.size();
         return true;
     }
     const gpu3d_mesh_polygon *mesh_for(const gpu3d_geometry_frame &scene,size_t at,
@@ -1139,7 +1316,20 @@ class gles2 final:public gpu3d {
         // Reuse descriptors and their flat-polygon storage between frames.
         index_overflow=false;size_t job_count=0;batch_draws.clear();batch_modes.clear();
         for(auto &entry:direct_buckets)entry.second={};
-        if(count&&!polys&&(!packets_ready||!draw_lists_ready))return false;
+        draw_maps.clear();
+        draw_maps.emplace_back();
+        const auto add_map=[&](const vf2_batch::tile &a,const vf2_batch::tile &b){
+            const size_t slot=draw_maps.size();
+            draw_maps.push_back({a.transform[0],a.transform[1],a.transform[2],a.transform[3],
+                                 b.transform[0],b.transform[1],b.transform[2],b.transform[3]});
+            return slot;
+        };
+        static const bool plan_fail_stats=std::getenv("VF2_PLAN_FAIL_STATS")!=nullptr;
+        if(count&&!polys&&(!packets_ready||!draw_lists_ready)){
+            if(plan_fail_stats)std::fprintf(stderr,"Plan fail 1 (lists not ready): frame %llu packets_ready=%d draw_lists_ready=%d count=%zu\n",
+                (unsigned long long)painted_frames+1,packets_ready,draw_lists_ready,count);
+            return false;
+        }
         if(!packets_ready)prepare_packets(polys,count,f);
         packets_ready=false;
         const auto *scene=mesh_render&&frame_indexed&&compact_packets?f.mesh_scene:nullptr;
@@ -1147,8 +1337,11 @@ class gles2 final:public gpu3d {
         std::unordered_map<uint64_t,uint64_t,vf2_batch::tile_hash> mixed_keys;
         const bool choose_modes=specialize_batches&&!owners&&!scene;
         static const bool textured_modes=std::getenv("VF2_TEXTURED_TRANSPARENT_SHADER")!=nullptr;
-        const auto append_to_bucket=[&](draw_work &work,uint64_t key){
-            auto &bucket=direct_buckets[key];
+        bool use_compact=compact_meta;
+        const bool force_wide=test_compact_fallback&&painted_frames%2!=0;
+        const auto append_to_bucket=[&](draw_work &work,uint64_t key,direct_bucket *cached=nullptr){
+            if(use_compact&&work.n&&(force_wide||!can_compact(work.material)))use_compact=false;
+            auto &bucket=cached?*cached:direct_buckets[key];
             work.bucket=&bucket;
             work.first_vertex=bucket.vertices;work.first_index=bucket.indices;
             bucket.vertices+=work.n;bucket.indices+=work.ni;
@@ -1165,6 +1358,15 @@ class gles2 final:public gpu3d {
         }
         const bool use_worker_jobs=draw_lists_ready&&!owners;
         if(use_worker_jobs){
+            constexpr size_t pair_cache_size=512;
+            static const bool cache_pairs=std::getenv("VF2_ATLAS_PAIR_CACHE")!=nullptr;
+            static const bool cache_stats=std::getenv("VF2_ATLAS_PAIR_CACHE_STATS")!=nullptr;
+            static const bool cache_buckets=std::getenv("DAYTONA_ATLAS_PAIR_BUCKET")!=nullptr;
+            // Atlas placements stay stable during this plan. Start with no
+            // valid entries on every call, including a retry after a clear.
+            std::bitset<pair_cache_size> valid_pairs;
+            if(cache_pairs&&atlas_pair_cache.empty())atlas_pair_cache.resize(pair_cache_size);
+            size_t pair_requests=0,pair_hits=0;
             ++prepared_draw_frames;
             for(auto &range:prepared_draws){
                 range.first_job=job_count;
@@ -1174,13 +1376,39 @@ class gles2 final:public gpu3d {
                     auto &work=draw.work;
                     const auto &texture=draw.texture;
                     uint64_t key=0;
+                    atlas_pair_entry *entry=nullptr;
+                    bool hit=false;
                     if(texture.texw){
                         const unsigned row=rows[draw.polygon];
                         work.material.palette[0]=palette_x_attribute(row);work.material.palette[1]=palette_y(row);
-                        const auto [a,b]=batch_atlas.get_pair(rams,texture,draw.band,draw.max_level,draw.native_repeat);
-                        if(!a||!b)return false;
-                        std::copy_n(a->transform,4,work.map.begin());std::copy_n(b->transform,4,work.map.begin()+4);
-                        key=(uint64_t(a->page)<<32)|b->page;
+                        unsigned slot=0;
+                        if(cache_pairs){
+                            const uint32_t hash=(uint32_t(texture.texx)*0x9e3779b1u)^(uint32_t(texture.texy)*0x85ebca6bu)^
+                                (uint32_t(draw.band+1)*0xc2b2ae35u)^(uint32_t(texture.texw)*0x27d4eb2du+texture.texh);
+                            slot=hash>>23;
+                            entry=&atlas_pair_cache[slot];
+                            hit=valid_pairs[slot]&&entry->band==draw.band&&entry->max_level==draw.max_level&&
+                                entry->native_repeat==draw.native_repeat&&entry->texture==texture;
+                        }
+                        if(hit){
+                            work.map_slot=entry->map_slot;
+                            key=entry->page_key;
+                        }else{
+                            vf2_batch::tile a,b;
+                            if(!batch_atlas.get_pair(rams,texture,draw.band,draw.max_level,draw.native_repeat,a,b)){
+                                if(plan_fail_stats)std::fprintf(stderr,"Plan fail 2 (get_pair worker): frame %llu at=%zu/%zu band=%d level=%d tex=%ux%u page_count=%zu resident=%zu allocated=%zu/%zu\n",
+                                    (unsigned long long)painted_frames+1,at,count,draw.band,draw.max_level,texture.texw,texture.texh,
+                                    batch_atlas.page_count(),batch_atlas.resident(),batch_atlas.allocated_bytes(),vf2_batch::tile_atlas::capacity_bytes());
+                                return false;
+                            }
+                            work.map_slot=add_map(a,b);
+                            key=(uint64_t(a.page)<<32)|b.page;
+                            if(entry){
+                                *entry={texture,draw.band,draw.max_level,draw.native_repeat,work.map_slot,key};
+                                valid_pairs[slot]=true;
+                            }
+                        }
+                        if(cache_stats){++pair_requests;pair_hits+=hit;}
                         if(cell_vertex_stats){
                             if(shared_packets_active){
                                 const auto source=range.locations[at].source;
@@ -1192,14 +1420,22 @@ class gles2 final:public gpu3d {
                             }
                         }
                     }
-                    append_to_bucket(work,key);
+                    // Hash nodes keep their addresses across insertions.
+                    // The per-plan valid bits prevent reuse after a new plan.
+                    append_to_bucket(work,key,cache_buckets&&hit?entry->cached_bucket:nullptr);
+                    if(cache_buckets&&entry&&!hit)entry->cached_bucket=work.bucket;
                 }
             }
             prepared_draw_jobs+=job_count;
+            if(cache_stats)std::fprintf(stderr,"Atlas pair cache: %zu %zu\n",pair_requests,pair_hits);
         }else for(size_t at=0;at<count;++at){
             const auto &p=polys[at];if(p.n<3||p.n>8||p.renderer==1)continue;
             const bool textured=p.renderer&2;if(textured&&(!p.texw||!p.texh))continue;
-            if(p.texlod<-32768||p.texlod>32767)return false;
+            if(p.texlod<-32768||p.texlod>32767){
+                if(plan_fail_stats)std::fprintf(stderr,"Plan fail 3 (texlod): frame %llu at=%zu texlod=%d\n",
+                    (unsigned long long)painted_frames+1,at,int(p.texlod));
+                return false;
+            }
             const int x0=std::max(0,int(p.vp[0])*f.scale),x1=std::min(width,(int(p.vp[1])+1)*f.scale);
             const int y0=std::max(0,int(p.vp[2])*f.scale),y1=std::min(height,(int(p.vp[3])+1)*f.scale);
             if(x1<=x0||y1<=y0)continue;
@@ -1220,7 +1456,7 @@ class gles2 final:public gpu3d {
                 const auto *indexed=textured&&frame_indexed?batch_packets[at].indexed_at(band):nullptr;
                 if(textured&&(frame_indexed?(!indexed||indexed->indices.empty()):batch_packets[at].bands[band+1].empty()))continue;
                 if(job_count==direct_jobs.size())direct_jobs.emplace_back();
-                direct_work &work=direct_jobs[job_count++];work.material=material;
+                direct_work &work=direct_jobs[job_count++];work.material=material;work.map_slot=0;
                 work.texw=work.texh=0;work.n=work.ni=0;work.mesh=nullptr;work.fan=nullptr;work.ordinary=nullptr;
                 uint64_t key=0;
                 if(textured){
@@ -1229,14 +1465,18 @@ class gles2 final:public gpu3d {
                     work.vertices=vertices.data();work.n=vertices.size();
                     if(indexed)work.set_packet(*indexed);
                     const bool native_repeat=indexed&&indexed->native_repeat;
-                    const auto [a,b]=batch_atlas.get_pair(rams,p,band,max_level,native_repeat);
-                    if(!a||!b)return false;
+                    vf2_batch::tile a,b;
+                    if(!batch_atlas.get_pair(rams,p,band,max_level,native_repeat,a,b)){
+                        if(plan_fail_stats)std::fprintf(stderr,"Plan fail 4 (get_pair serial): frame %llu at=%zu/%zu band=%d level=%d tex=%ux%u page_count=%zu resident=%zu allocated=%zu/%zu\n",
+                            (unsigned long long)painted_frames+1,at,count,band,max_level,p.texw,p.texh,
+                            batch_atlas.page_count(),batch_atlas.resident(),batch_atlas.allocated_bytes(),vf2_batch::tile_atlas::capacity_bytes());
+                        return false;
+                    }
                     work.material.info1[1]=band;work.material.info1[2]=band<0?(p.utex?2:0):(band<max_level?1:0);
-                    work.map={a->transform[0],a->transform[1],a->transform[2],a->transform[3],
-                        b->transform[0],b->transform[1],b->transform[2],b->transform[3]};
+                    work.map_slot=add_map(a,b);
                     work.texw=p.texw;work.texh=p.texh;
                     work.power_of_two=!(p.texw&(p.texw-1))&&!(p.texh&(p.texh-1));
-                    key=(uint64_t(a->page)<<32)|b->page;
+                    key=(uint64_t(a.page)<<32)|b.page;
                     if(scene&&std::has_single_bit(prepared.active_bands)){
                         work.mesh=mesh_for(*scene,at,p,work,f.scale);
                         if(work.mesh){
@@ -1274,7 +1514,12 @@ class gles2 final:public gpu3d {
             auto &bucket=entry.second;if(!bucket.vertices)continue;
             if(frame_indexed){
                 if(!bucket.indices)continue;
-                if(nv+bucket.vertices>65536){index_overflow=true;return false;}
+                if(nv+bucket.vertices>65536){
+                    index_overflow=true;
+                    if(plan_fail_stats)std::fprintf(stderr,"Plan fail 5 (index overflow): frame %llu nv=%zu bucket_vertices=%zu count=%zu draws=%zu\n",
+                        (unsigned long long)painted_frames+1,nv,bucket.vertices,count,batch_draws.size());
+                    return false;
+                }
                 batch_draws.push_back({unsigned((entry.first>>32)&0xffff),unsigned(entry.first),unsigned(ni),unsigned(bucket.indices),unsigned(entry.first>>48)});
             }else batch_draws.push_back({unsigned(entry.first>>32),unsigned(entry.first),unsigned(nv),unsigned(bucket.vertices)});
             if(choose_modes){
@@ -1286,18 +1531,27 @@ class gles2 final:public gpu3d {
             }
             bucket.first_vertex=nv;bucket.first_index=ni;nv+=bucket.vertices;ni+=bucket.indices;
         }
-        batch_vertices.resize(nv);batch_indices.resize(ni);
+        compact_ready=use_compact;
+        if(compact_ready){
+            if(compact_vertices.size()<nv)compact_vertices.resize(nv);
+        }else if(batch_vertices.size()<nv)batch_vertices.resize(nv);
+        if(batch_indices.size()<ni)batch_indices.resize(ni);
+        batch_vertex_count=nv;batch_index_count=ni;
         // No GL calls or container mutations below: each job owns its spans.
-        const auto pack_job=[&](const draw_work &work,const gpu3d_mesh_polygon *mesh){
+        const auto pack_job=[&](auto &vertices,const draw_work &work,const gpu3d_mesh_polygon *mesh){
             if(!work.n)return;
-            const auto &map=work.map;
+            const auto &map=draw_maps[work.map_slot];
             const bool textured=work.texw!=0;
             const float inverse_w=textured?1.f/work.texw:0,inverse_h=textured?1.f/work.texh:0;
             const auto *source=work.vertices;
-            auto *destination=batch_vertices.data()+work.bucket->first_vertex+work.first_vertex;
+            auto *destination=vertices.data()+work.bucket->first_vertex+work.first_vertex;
+            const auto &material=[&](){
+                if constexpr(sizeof(*destination)==sizeof(compact_vertex))return compact(work.material);
+                else return work.material;
+            }();
             const auto copy_vertex=[&](size_t i,const vf2_tiles::point &p,const float *a,const float *b){
                 auto &v=destination[i];
-                v.material=work.material;
+                v.material=material;
                 if(mesh)std::copy_n(mesh->position[i].data(),3,v.position_q);
                 else{v.position_q[0]=p.x;v.position_q[1]=p.y;v.position_q[2]=p.q;}
                 if(textured){
@@ -1330,7 +1584,7 @@ class gles2 final:public gpu3d {
                 for(size_t i=0;i<work.ni;++i)out[i]=uint16_t(first_vertex+indices[i]);
             }
         };
-        const auto pack_range=[&](int begin,int end){
+        const auto pack_into=[&](auto &vertices,int begin,int end){
             if(use_worker_jobs){
                 for(auto &range:prepared_draws){
                     const int base=int(range.first_job);
@@ -1339,26 +1593,26 @@ class gles2 final:public gpu3d {
                     for(int j=first;j<last;++j){
                         auto &work=range.draws[j].work;
                         if(shared_packets_active)bind_shared_packet(range,j,work);
-                        pack_job(work,nullptr);
+                        pack_job(vertices,work,nullptr);
                     }
                 }
-            }else for(int j=begin;j<end;++j)pack_job(direct_jobs[j],direct_jobs[j].mesh);
+            }else for(int j=begin;j<end;++j)pack_job(vertices,direct_jobs[j],direct_jobs[j].mesh);
+        };
+        const auto pack_range=[&](int begin,int end){
+            if(compact_ready)pack_into(compact_vertices,begin,end);
+            else pack_into(batch_vertices,begin,end);
         };
         const auto pack_start=timing_packets?clock::now():clock::time_point{};
         static const bool dual_pack=std::getenv("VF2_DUAL_PACK")!=nullptr;
         if(dual_pack&&job_count>=8&&row_pool::get().threads()>1){
-            constexpr int ranges=8;
-            std::atomic<int> next{0};
+            constexpr int ranges=32;
             const int count=int(job_count);
-            const auto take_ranges=[&]{
-                for(int part=next.fetch_add(1,std::memory_order_relaxed);part<ranges;
-                    part=next.fetch_add(1,std::memory_order_relaxed)){
-                    pack_range(count*part/ranges,count*(part+1)/ranges);
-                }
-            };
-            pack_worker.start(take_ranges);
-            take_ranges();
-            pack_worker.wait();
+            // The pool workers are idle between packet preparation and this
+            // phase, so pack on the caller and every one of them instead of
+            // starting one helper thread.
+            parallel_tasks(ranges,[&](int part){
+                pack_range(count*part/ranges,count*(part+1)/ranges);
+            });
         }else parallel_rows(int(job_count),pack_range,4);
         if(timing_packets)current_pack_ms+=phase_ms(pack_start,clock::now());
         return true;
@@ -1366,6 +1620,7 @@ class gles2 final:public gpu3d {
     bool prepare_batch(const gpu3d_poly *polys,size_t count,const gpu3d_frame &f,const std::vector<unsigned> &rows,bool owners){
         static const bool direct=std::getenv("VF2_GLES_DIRECT_PACK")!=nullptr;
         static const bool check=std::getenv("VF2_CHECK_DIRECT_PACK")!=nullptr;
+        compact_ready=false;
         if(!direct&&!check)return prepare_batch_reference(polys,count,f,rows,owners);
         if(!prepare_batch_direct(polys,count,f,rows,owners))return false;
         static const bool hash_draw_stream=std::getenv("VF2_DRAW_STREAM_HASH")!=nullptr;
@@ -1376,8 +1631,14 @@ class gles2 final:public gpu3d {
                 const auto size=items.size()*sizeof(items.front());
                 for(size_t i=0;i<size;++i)hash=(hash^bytes[i])*1099511628211ull;
             };
+            const auto add_n=[&](const auto *items,size_t count){
+                const auto *bytes=reinterpret_cast<const unsigned char *>(items);
+                const auto size=count*sizeof(*items);
+                for(size_t i=0;i<size;++i)hash=(hash^bytes[i])*1099511628211ull;
+            };
             if(hash_palette_colours){
-                for(const auto &vertex:batch_vertices){
+                for(size_t vi=0;vi<batch_vertex_count;++vi){
+                    const auto &vertex=batch_vertices[vi];
                     auto normalized=vertex;
                     if(vertex.material.info0[0]){
                         const unsigned x=vertex.material.palette[0], y=vertex.material.palette[1];
@@ -1389,28 +1650,52 @@ class gles2 final:public gpu3d {
                     normalized.material.palette[0]=normalized.material.palette[1]=0;
                     hash_bytes(hash,&normalized,sizeof(normalized));
                 }
-            }else add(batch_vertices);
-            add(batch_indices);add(batch_draws);
+            }else add_n(batch_vertices.data(),batch_vertex_count);
+            add_n(batch_indices.data(),batch_index_count);add(batch_draws);
             std::fprintf(stderr,"GPU draw stream: %016llx %zu %zu %zu\n",
-                         (unsigned long long)hash,batch_vertices.size(),batch_indices.size(),batch_draws.size());
+                         (unsigned long long)hash,batch_vertex_count,batch_index_count,batch_draws.size());
         }
         if(check){
-            auto vertices=batch_vertices;auto indices=batch_indices;auto draws=batch_draws;
+            std::vector<batch_vertex> vertices(batch_vertices.begin(),batch_vertices.begin()+batch_vertex_count);
+            std::vector<uint16_t> indices(batch_indices.begin(),batch_indices.begin()+batch_index_count);
+            auto draws=batch_draws;
             if(!prepare_batch_reference(polys,count,f,rows,owners))return false;
-            const bool same=vertices.size()==batch_vertices.size()&&indices==batch_indices&&draws.size()==batch_draws.size()&&
+            const bool same=vertices.size()==batch_vertex_count&&indices.size()==batch_index_count&&draws.size()==batch_draws.size()&&
                 (vertices.empty()||std::memcmp(vertices.data(),batch_vertices.data(),vertices.size()*sizeof(batch_vertex))==0)&&
                 (draws.empty()||std::memcmp(draws.data(),batch_draws.data(),draws.size()*sizeof(batch_draw))==0);
             if(!same){std::fprintf(stderr,"Direct vertex packing differs from reference\n");std::abort();}
         }
         return true;
     }
+    mutable double submit_phase_ms[8]{};
+    mutable unsigned long long submit_phase_calls[8]{};
+    mutable double draw_call_ms=0,draw_call_max_ms=0;
+    mutable unsigned long long draw_call_count=0,draw_call_indices=0;
     const bool trace_slow_submits=std::getenv("VF2_TRACE_SLOW_SUBMITS")!=nullptr;
     void trace_submit_phase(const char *phase,std::chrono::steady_clock::time_point start)const{
         if(!trace_slow_submits)return;
         const double elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+        // Accumulate a per-phase average: the 2 ms totals hide behind 8 ms
+        // outliers when only the slow frames are printed.
+        static const char *names[8]={"target-underlay","state-vertices","draw-calls","overlay-finish","texture-atlas","palette","",""};
+        for(unsigned i=0;i<8;++i)if(std::strcmp(names[i],phase)==0){submit_phase_ms[i]+=elapsed;++submit_phase_calls[i];break;}
         if(elapsed>=8)
             std::fprintf(stderr,"Slow 3D submit: draw %llu phase %s %.3f ms\n",
                          (unsigned long long)painted_frames+1,phase,elapsed);
+    }
+
+    bool paint_underlay(const gpu3d_frame &f){
+#ifdef MODEL2_ORIGINAL
+        static const bool combine_clear=std::getenv("DAYTONA_COMBINE_UNDERLAY_CLEAR")!=nullptr;
+#else
+        constexpr bool combine_clear=false;
+#endif
+        // Clear both attachments before the first draw to the scene target.
+        glDepthMask(GL_TRUE);
+        glClearDepthf(1);
+        glDisable(GL_SCISSOR_TEST);
+        if(!combine_clear)glClear(GL_DEPTH_BUFFER_BIT);
+        return f.underlay(f.layers,combine_clear);
     }
 
     bool paint_batch(const gpu3d_frame &f,int target,bool owners){
@@ -1419,22 +1704,17 @@ class gles2 final:public gpu3d {
         glBindFramebuffer(GL_FRAMEBUFFER,fbo);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,targets[target],0);
         glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_RENDERBUFFER,depth_buffer);
         if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){glBindFramebuffer(GL_FRAMEBUFFER,prior);return false;}
-        if(!owners&&f.underlay){
-            // Clear depth before any colour drawing. A mid-frame depth clear
-            // can split a tile-based GPU's render pass and spill the colour.
-            glDepthMask(GL_TRUE);glClearDepthf(1);glDisable(GL_SCISSOR_TEST);glClear(GL_DEPTH_BUFFER_BIT);
-            if(!f.underlay(f.layers)){glBindFramebuffer(GL_FRAMEBUFFER,prior);return false;}
-        }
+        if(!owners&&f.underlay&&!paint_underlay(f)){glBindFramebuffer(GL_FRAMEBUFFER,prior);return false;}
         trace_submit_phase("target-underlay",phase);
         if(trace_slow_submits)phase=std::chrono::steady_clock::now();
         glViewport(0,0,width,height);glEnable(GL_DEPTH_TEST);glDepthFunc(GL_LESS);glDepthMask(GL_TRUE);glClearDepthf(1);
         glDisable(GL_CULL_FACE);glDisable(GL_BLEND);glDisable(GL_SCISSOR_TEST);glDisable(GL_DITHER);
         glClearColor(owners?1.f:0.f,owners?1.f:0.f,owners?1.f:0.f,owners?1.f:0.f);if(owners||!f.underlay)glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
         const auto activate=[&](unsigned mode){
-            auto &p=batch_programs[mode];
+            auto &p=compact_ready?compact_programs[mode]:batch_programs[mode];
             glUseProgram(p.name);
             if(!specialize_batches){
-                glUniform2f(p.size,width,height);glUniform1f(p.scale,f.scale);
+                glUniform2f(p.size,width,height);glUniform2f(p.scale,float(width)/496.f,float(height)/384.f);
                 glUniform1f(p.height,height);glUniform1f(p.owners,owners);
                 glUniform1i(p.atlas_a,0);glUniform1i(p.atlas_b,1);glUniform1i(p.palette,2);
                 return;
@@ -1443,10 +1723,10 @@ class gles2 final:public gpu3d {
             // switches. Only the renderer owns these handles.
             if(p.configured_width!=width||p.configured_height!=height){
                 glUniform2f(p.size,width,height);glUniform1f(p.height,height);
+                // The shader normalises arcade coordinates: the picture fills
+                // the target whatever its size (integer scaling or not).
+                glUniform2f(p.scale,float(width)/496.f,float(height)/384.f);
                 p.configured_width=width;p.configured_height=height;
-            }
-            if(p.configured_scale!=f.scale){
-                glUniform1f(p.scale,f.scale);p.configured_scale=f.scale;
             }
             if(p.owners>=0&&p.configured_owner!=int(owners)){
                 glUniform1f(p.owners,owners);p.configured_owner=int(owners);
@@ -1456,16 +1736,32 @@ class gles2 final:public gpu3d {
         unsigned active_mode=choose_modes?batch_modes.front():0;
         activate(active_mode);
         glActiveTexture(GL_TEXTURE2);glBindTexture(GL_TEXTURE_2D,palette_atlas);
+        if(compact_meta){
+            if(compact_ready)++compact_frames;
+            else ++wide_fallback_frames;
+        }
+        const auto *vertices=compact_ready?static_cast<const void*>(compact_vertices.data()):batch_vertices.data();
+        const size_t stride=compact_ready?sizeof(compact_vertex):sizeof(batch_vertex);
         if(client_arrays){
             glBindBuffer(GL_ARRAY_BUFFER,0);glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,0);
         }else{
             glBindBuffer(GL_ARRAY_BUFFER,tile_vbo);
-            glBufferData(GL_ARRAY_BUFFER,batch_vertices.size()*sizeof(batch_vertex),batch_vertices.data(),GL_STREAM_DRAW);
-            if(frame_indexed){glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,tile_ibo);glBufferData(GL_ELEMENT_ARRAY_BUFFER,batch_indices.size()*sizeof(uint16_t),batch_indices.data(),GL_STREAM_DRAW);}
+            glBufferData(GL_ARRAY_BUFFER,batch_vertex_count*stride,vertices,GL_STREAM_DRAW);
+            if(frame_indexed){glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,tile_ibo);glBufferData(GL_ELEMENT_ARRAY_BUFFER,batch_index_count*sizeof(uint16_t),batch_indices.data(),GL_STREAM_DRAW);}
         }
         const unsigned sizes[8]={3,2,2,1,4,4,2,4},offsets[8]={0,12,20,28,32,36,44,48};
         const GLenum types[8]={GL_FLOAT,GL_FLOAT,GL_FLOAT,GL_FLOAT,GL_UNSIGNED_BYTE,GL_SHORT,GL_UNSIGNED_SHORT,GL_UNSIGNED_BYTE};
-        for(unsigned i=0;i<8;i++){glEnableVertexAttribArray(i);glVertexAttribPointer(i,sizes[i],types[i],i==7?GL_TRUE:GL_FALSE,sizeof(batch_vertex),reinterpret_cast<void*>((client_arrays?reinterpret_cast<uintptr_t>(batch_vertices.data()):0)+offsets[i]));}
+        const unsigned compact_sizes[8]={3,2,2,1,1,1,1,3},compact_offsets[8]={0,12,20,28,36,32,34,37};
+        for(unsigned i=0;i<8;++i){
+            glEnableVertexAttribArray(i);
+            const auto offset=compact_ready?compact_offsets[i]:offsets[i];
+            glVertexAttribPointer(i,compact_ready?compact_sizes[i]:sizes[i],types[i],i==7?GL_TRUE:GL_FALSE,
+                stride,reinterpret_cast<void*>((client_arrays?reinterpret_cast<uintptr_t>(vertices):0)+offset));
+        }
+        // Ceiling probe: skipping aUV1 (8 bytes) shows how submit scales with
+        // the per-vertex byte count on the client-array path.
+        static const bool skip_uv1=std::getenv("VF2_SKIP_UV1")!=nullptr;
+        if(skip_uv1)glDisableVertexAttribArray(2);
         trace_submit_phase("state-vertices",phase);
         if(trace_slow_submits)phase=std::chrono::steady_clock::now();
         unsigned uploaded_mesh_group=0;
@@ -1484,8 +1780,14 @@ class gles2 final:public gpu3d {
                 glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,batch_atlas.handle(draw.page_a));
                 glActiveTexture(GL_TEXTURE1);glBindTexture(GL_TEXTURE_2D,batch_atlas.handle(draw.page_b));
             }
+            const auto draw_begin=trace_slow_submits?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
             if(frame_indexed)glDrawElements(GL_TRIANGLES,draw.count,GL_UNSIGNED_SHORT,reinterpret_cast<void*>((client_arrays?reinterpret_cast<uintptr_t>(batch_indices.data()):0)+draw.first*sizeof(uint16_t)));
             else glDrawArrays(GL_TRIANGLES,draw.first,draw.count);
+            if(trace_slow_submits){
+                const double d=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-draw_begin).count();
+                draw_call_ms+=d;if(d>draw_call_max_ms)draw_call_max_ms=d;
+                draw_call_indices+=draw.count;++draw_call_count;
+            }
         }
         trace_submit_phase("draw-calls",phase);
         if(trace_slow_submits)phase=std::chrono::steady_clock::now();
@@ -1507,7 +1809,23 @@ class gles2 final:public gpu3d {
                          (unsigned long long)p.upload_bytes,p.prepare_ms,p.upload_ms,palette_count);
             palette_stats={};
         }
-        if(++painted_frames%30==0&&std::getenv("VF2_GLES_STATS"))std::fprintf(stderr,"GLES batch: %zu draws, %zu vertices, %zu indices, %zu tiles, %zu pages, %zu palettes; atlas uploaded %llu bytes, %llu clears\n",batch_draws.size(),batch_vertices.size(),batch_indices.size(),batch_atlas.resident(),batch_atlas.page_count(),size_t(palette_count),(unsigned long long)batch_atlas.uploaded,(unsigned long long)batch_atlas.clears);
+        if(++painted_frames%30==0&&std::getenv("VF2_GLES_STATS"))std::fprintf(stderr,"GLES batch: %zu draws, %zu vertices, %zu indices, %zu tiles, %zu pages, %zu palettes; atlas uploaded %llu bytes, %llu clears\n",batch_draws.size(),batch_vertex_count,batch_index_count,batch_atlas.resident(),batch_atlas.page_count(),size_t(palette_count),(unsigned long long)batch_atlas.uploaded,(unsigned long long)batch_atlas.clears);
+        // Per-phase submit average: separates the vertex upload from the draw
+        // submission so the 4 ms submit can be attributed.
+        if(painted_frames%30==0&&trace_slow_submits){
+            static const char *names_print[8]={"target-underlay","state-vertices","draw-calls","overlay-finish","texture-atlas","palette","",""};
+            std::fputs("Submit phases:",stderr);
+            for(unsigned i=0;i<8;++i)if(submit_phase_calls[i])
+                std::fprintf(stderr," %s %.3f",names_print[i],
+                    submit_phase_ms[i]/submit_phase_calls[i]);
+            std::fputc('\n',stderr);
+            if(draw_call_count)
+                std::fprintf(stderr,"Draw calls: %llu calls %.3f ms total %.1f us/call max %.1f us, %llu indices %.1f ns/index\n",
+                    (unsigned long long)draw_call_count,draw_call_ms,
+                    draw_call_ms/draw_call_count*1000.0,draw_call_max_ms*1000.0,
+                    (unsigned long long)draw_call_indices,
+                    draw_call_indices?draw_call_ms/draw_call_indices*1e6:0.0);
+        }
         if(choose_modes&&painted_frames%30==0&&std::getenv("VF2_GLES_STATS"))
             std::fprintf(stderr,"Atlas shader draws/indices: %llu/%llu %llu/%llu %llu/%llu %llu/%llu\n",
                 (unsigned long long)mode_draws[0],(unsigned long long)mode_indices[0],
@@ -1593,15 +1911,10 @@ class gles2 final:public gpu3d {
         glBindFramebuffer(GL_FRAMEBUFFER,fbo);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,targets[target],0);
         glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_RENDERBUFFER,depth_buffer);
         if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){glBindFramebuffer(GL_FRAMEBUFFER,prior);return false;}
-        if(!owners&&f.underlay){
-            // Clear depth before any colour drawing. A mid-frame depth clear
-            // can split a tile-based GPU's render pass and spill the colour.
-            glDepthMask(GL_TRUE);glClearDepthf(1);glDisable(GL_SCISSOR_TEST);glClear(GL_DEPTH_BUFFER_BIT);
-            if(!f.underlay(f.layers)){glBindFramebuffer(GL_FRAMEBUFFER,prior);return false;}
-        }
+        if(!owners&&f.underlay&&!paint_underlay(f)){glBindFramebuffer(GL_FRAMEBUFFER,prior);return false;}
         glViewport(0,0,width,height);glEnable(GL_DEPTH_TEST);glDepthFunc(GL_LESS);glDepthMask(GL_TRUE);glClearDepthf(1.f);glDisable(GL_CULL_FACE);glDisable(GL_BLEND);glDisable(GL_SCISSOR_TEST);
         glDisable(GL_DITHER);glClearColor(owners?1.f:0.f,owners?1.f:0.f,owners?1.f:0.f,owners?1.f:0.f);if(owners||!f.underlay)glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
-        glUseProgram(program);glUniform2f(loc.uSize,width,height);glUniform1f(loc.uScale,f.scale);
+        glUseProgram(program);glUniform2f(loc.uSize,width,height);glUniform2f(loc.uScale,float(width)/496.f,float(height)/384.f);
         glUniform1f(loc.uHeight,height);glUniform1f(loc.uOwnerMode,owners?1.f:0.f);
         for(int i=0;i<4;i++){glActiveTexture(GL_TEXTURE0+i);glBindTexture(GL_TEXTURE_2D,sheets[i]);}
         glUniform1i(loc.uSheet00,0);glUniform1i(loc.uSheet01,1);glUniform1i(loc.uSheet10,2);glUniform1i(loc.uSheet11,3);glUniform1i(loc.uPalette,4);
@@ -1694,6 +2007,8 @@ class gles2 final:public gpu3d {
     }
 public:
     ~gles2() override {
+        if(cull_sampleless)std::fprintf(stderr,"Sampleless cull: %llu polygons, %d raster subpixel bits\n",
+            (unsigned long long)sampleless_polygons,raster_subpixel_bits);
         if(shared_packet_frames)std::fprintf(stderr,"Shared packet storage: %llu frames\n",(unsigned long long)shared_packet_frames);
         if(packet_trim_test)std::fprintf(stderr,"Packet trim test: %llu trims, %016llx capacity trace\n",
             (unsigned long long)packet_trims,(unsigned long long)packet_trim_checksum);
@@ -1705,12 +2020,16 @@ public:
                          (unsigned long long)prepared_draw_frames,(unsigned long long)prepared_draw_jobs);
         for(size_t i=0;i<packet_phases.size();++i){
             const auto &phase=packet_phases[i];
-            std::fprintf(stderr,"Packet phases %zu %.6f %.6f %.6f\n",i+1,phase[0],phase[1],phase[2]);
+            std::fprintf(stderr,"Packet phases %zu %.6f %.6f %.6f %.6f\n",i+1,phase[0],phase[1],phase[2],phase[3]);
         }
         if(rotate_palette_atlas)std::fprintf(stderr,"3D palette texture switches: %llu\n",(unsigned long long)palette_switches);
         release_retired_tiles();clear_tiles();clear_palettes();glDeleteTextures(1,&palette_atlas);
         glDeleteTextures(1,&palette_spare);
-        glDeleteTextures(targets.size(),targets.data());glDeleteTextures(4,sheets);glDeleteBuffers(1,&vbo);glDeleteBuffers(1,&tile_vbo);glDeleteBuffers(1,&tile_ibo);glDeleteRenderbuffers(1,&depth_buffer);glDeleteFramebuffers(1,&fbo);glDeleteProgram(program);for(const auto &p:batch_programs)if(p.name)glDeleteProgram(p.name);}
+        glDeleteTextures(targets.size(),targets.data());glDeleteTextures(4,sheets);glDeleteBuffers(1,&vbo);glDeleteBuffers(1,&tile_vbo);glDeleteBuffers(1,&tile_ibo);glDeleteRenderbuffers(1,&depth_buffer);glDeleteFramebuffers(1,&fbo);glDeleteProgram(program);for(const auto &p:batch_programs)if(p.name)glDeleteProgram(p.name);
+        for(const auto &p:compact_programs)if(p.name)glDeleteProgram(p.name);
+        if(compact_meta)std::fprintf(stderr,"Compact vertex frames: %zu packed, %zu wide fallback\n",
+                                    compact_frames,wide_fallback_frames);
+    }
     bool init() {
         if(!glGetString(GL_VERSION))return false;
         if(!std::getenv("VF2_KEEP_DEPTH")&&std::strstr(reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS)),"GL_EXT_discard_framebuffer"))
@@ -1740,25 +2059,29 @@ public:
             glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,palette_banks*palette_width,palette_height,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
         }
         if(use_batches){
+            if(compact_meta)std::fprintf(stderr,"Probe: 40-byte vertex metadata\n");
             GLint prior_program=0;
             if(specialize_batches)glGetIntegerv(GL_CURRENT_PROGRAM,&prior_program);
             const char *attributes[8]={"aPositionQ","aUV0","aUV1","aDepth","aInfo0","aInfo1","aPalette","aColour"};
-            for(unsigned mode=0;mode<(specialize_batches?batch_programs.size():1);++mode){
-                const GLuint a=shader(GL_VERTEX_SHADER,vf2_batch::vertex_shader,precision>0,low_coordinates,mesh_render);
-                const GLuint b=shader(GL_FRAGMENT_SHADER,mode==3?vf2_batch::fragment_shader_textured:vf2_batch::fragment_shader,precision>0,low_coordinates,false,mode);
-                if(!a||!b){if(a)glDeleteShader(a);if(b)glDeleteShader(b);return false;}
-                auto &p=batch_programs[mode];
-                p.name=glCreateProgram();glAttachShader(p.name,a);glAttachShader(p.name,b);
-                for(unsigned i=0;i<8;i++)glBindAttribLocation(p.name,i,attributes[i]);
-                glLinkProgram(p.name);glDeleteShader(a);glDeleteShader(b);glGetProgramiv(p.name,GL_LINK_STATUS,&ok);
-                if(!ok){char log[4096];glGetProgramInfoLog(p.name,sizeof(log),nullptr,log);std::fprintf(stderr,"GLES batch link: %s\n",log);return false;}
-                p.size=glGetUniformLocation(p.name,"uSize");p.scale=glGetUniformLocation(p.name,"uScale");
-                p.height=glGetUniformLocation(p.name,"uHeight");p.owners=glGetUniformLocation(p.name,"uOwnerMode");
-                p.atlas_a=glGetUniformLocation(p.name,"uAtlasA");p.atlas_b=glGetUniformLocation(p.name,"uAtlasB");
-                p.palette=glGetUniformLocation(p.name,"uPalette");
-                if(specialize_batches){
-                    glUseProgram(p.name);
-                    glUniform1i(p.atlas_a,0);glUniform1i(p.atlas_b,1);glUniform1i(p.palette,2);
+            for(unsigned layout=0;layout<(compact_meta?2u:1u);++layout){
+                const bool packed=layout!=0;
+                for(unsigned mode=0;mode<(specialize_batches?batch_programs.size():1);++mode){
+                    const GLuint a=shader(GL_VERTEX_SHADER,vf2_batch::vertex_shader,precision>0,low_coordinates,mesh_render,0,packed);
+                    const GLuint b=shader(GL_FRAGMENT_SHADER,mode==3?vf2_batch::fragment_shader_textured:vf2_batch::fragment_shader,precision>0,low_coordinates,false,mode);
+                    if(!a||!b){if(a)glDeleteShader(a);if(b)glDeleteShader(b);return false;}
+                    auto &p=packed?compact_programs[mode]:batch_programs[mode];
+                    p.name=glCreateProgram();glAttachShader(p.name,a);glAttachShader(p.name,b);
+                    for(unsigned i=0;i<8;i++)glBindAttribLocation(p.name,i,attributes[i]);
+                    glLinkProgram(p.name);glDeleteShader(a);glDeleteShader(b);glGetProgramiv(p.name,GL_LINK_STATUS,&ok);
+                    if(!ok){char log[4096];glGetProgramInfoLog(p.name,sizeof(log),nullptr,log);std::fprintf(stderr,"GLES batch link: %s\n",log);return false;}
+                    p.size=glGetUniformLocation(p.name,"uSize");p.scale=glGetUniformLocation(p.name,"uScale");
+                    p.height=glGetUniformLocation(p.name,"uHeight");p.owners=glGetUniformLocation(p.name,"uOwnerMode");
+                    p.atlas_a=glGetUniformLocation(p.name,"uAtlasA");p.atlas_b=glGetUniformLocation(p.name,"uAtlasB");
+                    p.palette=glGetUniformLocation(p.name,"uPalette");
+                    if(specialize_batches){
+                        glUseProgram(p.name);
+                        glUniform1i(p.atlas_a,0);glUniform1i(p.atlas_b,1);glUniform1i(p.palette,2);
+                    }
                 }
             }
             if(specialize_batches)glUseProgram(GLuint(prior_program));
@@ -1789,6 +2112,7 @@ public:
     void set_quality(gpu3d_quality)override{}
     gpu3d_quality quality()const override{return gpu3d_quality::fast;}
     bool make_targets(int w,int h,int count)override {
+        if(cull_sampleless)glGetIntegerv(GL_SUBPIXEL_BITS,&raster_subpixel_bits);
         if(w==width&&h==height&&int(targets.size())==count)return true;
         glDeleteTextures(targets.size(),targets.data());targets.assign(count,0);glGenTextures(count,targets.data());width=w;height=h;
         glBindRenderbuffer(GL_RENDERBUFFER,depth_buffer);glRenderbufferStorage(GL_RENDERBUFFER,GL_DEPTH_COMPONENT16,w,h);
@@ -1812,7 +2136,9 @@ public:
         if(f.w!=width||f.h!=height||f.scale<=0)return false;
         const auto start=std::chrono::steady_clock::now();
         staged_plan=false;staged_uploads=true;batch_atlas.defer_uploads(true);
+        const auto rams_start=clock::now();
         apply_rams(next,true);
+        const auto rams_end=clock::now();
         frame_indexed=indexed_batches;
         packets_ready=false;
         static const bool overlap_palette=std::getenv("VF2_OVERLAP_PALETTES")!=nullptr;
@@ -1823,26 +2149,53 @@ public:
             prepare_packets(polys,count,f,nullptr,allow_fans);
             palettes_ready=prepare_palettes(polys,count,staged_rows,false);
         }
+        if(vf2_tiles::clip_stats_on())vf2_tiles::clip_stats_print(stderr,"frame");
         const auto clipped=profile_packet_phases?clock::now():clock::time_point{};
         timing_packets=profile_packet_phases;
         current_pack_ms=0;
+        static const bool plan_fail_stats=std::getenv("VF2_PLAN_FAIL_STATS")!=nullptr;
         if constexpr(projected){
-            if(palettes_ready&&packets_ready&&draw_lists_ready)
+            if(palettes_ready&&packets_ready&&draw_lists_ready){
+                const auto claim_failures=batch_atlas.claim_failures;
                 staged_plan=prepare_batch(nullptr,count,f,staged_rows,false);
+                static const bool retry_atlas=std::getenv("VF2_RETRY_PROJECTED_ATLAS")!=nullptr;
+                if(!staged_plan&&retry_atlas&&batch_atlas.claim_failures!=claim_failures){
+                    // Clear deferred placements and retire GL names after the fence.
+                    batch_atlas.clear();
+                    if(cull_sampleless&&shared_packets_active&&
+                       std::any_of(prepared_draws.begin(),prepared_draws.end(),
+                                   [](const auto &range){return range.sampleless!=0;})){
+                        // Culling required the omitted materials to be resident.
+                        // Rebuild the packet list against the empty atlas.
+                        prepare_packets(polys,count,f,nullptr,allow_fans);
+                    }else packets_ready=true;
+                    staged_plan=packets_ready&&draw_lists_ready&&prepare_batch(nullptr,count,f,staged_rows,false);
+                    if(plan_fail_stats)std::fprintf(stderr,"Projected atlas retry at staged frame %llu: %s\n",
+                        (unsigned long long)staged_frames+1,staged_plan?"ready":"failed");
+                }
+            }else if(plan_fail_stats)std::fprintf(stderr,"Projected plan skipped at staged frame %llu: palettes=%d packets=%d draw_lists=%d count=%zu\n",
+                (unsigned long long)staged_frames+1,palettes_ready,packets_ready,draw_lists_ready,count);
+            if(plan_fail_stats&&!staged_plan)std::fprintf(stderr,"Projected plan FAILED at staged frame %llu (falling back to expanded polygons)\n",
+                (unsigned long long)staged_frames+1);
         }else if(palettes_ready){
             for(int attempt=0;attempt<2;++attempt){
                 if(prepare_batch(polys,count,f,staged_rows,false)){staged_plan=true;break;}
                 if(index_overflow){
+                    if(plan_fail_stats)std::fprintf(stderr,"Retry %d: index overflow, re-planning non-indexed at staged frame %llu\n",
+                        attempt,(unsigned long long)staged_frames+1);
                     frame_indexed=false;packets_ready=false;
                     if(prepare_batch(polys,count,f,staged_rows,false)){staged_plan=true;break;}
                 }
+                if(plan_fail_stats)std::fprintf(stderr,"Retry %d: clearing the atlas at staged frame %llu\n",
+                    attempt,(unsigned long long)staged_frames+1);
                 batch_atlas.clear();
             }
+            if(plan_fail_stats&&!staged_plan)std::fprintf(stderr,"Staged plan FAILED at staged frame %llu\n",(unsigned long long)staged_frames+1);
         }
         staged_polys=polys;staged_projected=projected;staged_count=count;staged_frame=f;
         const auto completed=clock::now();
         if(timing_packets){
-            packet_phases.push_back({phase_ms(start,clipped),phase_ms(clipped,completed)-current_pack_ms,current_pack_ms});
+            packet_phases.push_back({phase_ms(rams_start,rams_end),phase_ms(rams_end,clipped),phase_ms(clipped,completed)-current_pack_ms,current_pack_ms});
             timing_packets=false;
         }
         staged_cpu_ms=phase_ms(start,completed);

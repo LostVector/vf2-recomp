@@ -1556,6 +1556,16 @@ struct tgp_slice_options {
     bool reference_counts=std::getenv("VF2_TGP_COUNTER_REFERENCE")!=nullptr;
     bool native_jit=std::getenv("VF2_TGP_NATIVE_JIT")!=nullptr;
     bool packed_handlers=std::getenv("VF2_TGP_PACKED_HANDLERS")!=nullptr;
+#if defined(DAYTONA_TGP_COMMAND36_REGIONS)
+    bool daytona_fused_dispatch=std::getenv("DAYTONA_TGP_FUSED_DISPATCH")!=nullptr;
+    bool daytona_repeat_moves=std::getenv("DAYTONA_TGP_REPEAT_MOVES")!=nullptr;
+    bool daytona_cached_dispatch=std::getenv("DAYTONA_TGP_CACHED_DISPATCH")!=nullptr;
+    bool daytona_trace_cache=std::getenv("DAYTONA_TGP_TRACE_CACHED_DISPATCH")!=nullptr;
+    bool daytona_command36=[] {
+        const char *value=std::getenv("DAYTONA_TGP_COMMAND36");
+        return value&&value[0]=='1'&&value[1]=='\0';
+    }();
+#endif
     bool cached_entry=std::getenv("VF2_TGP_CACHED_ENTRY")&&!sample_pc&&!interpreter&&
         resume_native&&matrix_native&&single&&!guarded&&private_regions&&!reference_counts&&
         !native_jit&&!g_tgp_command_samples;
@@ -1569,6 +1579,34 @@ void mb86233_device::execute_run_impl(const u32 *mapped, const uint64_t *mapped_
     static const tgp_slice_options options;
     const bool sample_pc=options.sample_pc;
 #if defined(VF2_TGP_AOT)
+    const auto run_direct_handlers = [&](const compiled_entry *entries) {
+        uint32_t instructions=0;
+        while(m_icount>0) {
+            m_ppc=m_pc++;
+            ++instructions;
+            entries[m_ppc&0xfff].run(this);
+        }
+        m_compiled_instructions+=instructions;
+    };
+#if defined(DAYTONA_TGP_COMMAND36_REGIONS)
+    // Only the command table chosen after a complete uploaded-program
+    // comparison is cached. Hooks and live matrix continuations still
+    // enter through the general dispatcher.
+    if(m_cached_daytona_dispatch && mapped && mapped==m_checked_program &&
+       *mapped_revision && *mapped_revision==m_checked_revision &&
+       m_block_program_matches && m_fast_ram_checked && m_fast_ram.low && m_fast_ram.high &&
+       !on_instruction && !m_pending_matrix.active) {
+        m_private_regions_allowed=options.single&&options.private_regions;
+        m_native_matrix_allowed=options.matrix_native;
+        m_native_resume_allowed=options.matrix_native&&options.resume_native;
+        if(options.daytona_trace_cache&&!m_cached_daytona_reported) {
+            std::fprintf(stderr,"Daytona DSP cached dispatch hit\n");
+            m_cached_daytona_reported=true;
+        }
+        run_direct_handlers(m_cached_daytona_dispatch);
+        return;
+    }
+#endif
     const compiled_entry *program=options.interpreter?nullptr:compiled_program();
     const auto run_compiled_handlers=[&] {
         // This counter is diagnostic; update it once after the slice.
@@ -1583,10 +1621,8 @@ void mb86233_device::execute_run_impl(const u32 *mapped, const uint64_t *mapped_
                 return packed;
             }();
             while(m_icount>0){m_ppc=m_pc++;++instructions;handlers[m_ppc&0xfff](this);}
-        }else{
-            while(m_icount>0){m_ppc=m_pc++;++instructions;program[m_ppc&0xfff].run(this);}
-        }
-        m_compiled_instructions+=instructions;
+            m_compiled_instructions+=instructions;
+        }else run_direct_handlers(program);
     };
     // A previous slice validated this immutable mapped image and installed
     // the exact capabilities needed by the ordinary compiled-handler loop.
@@ -1627,6 +1663,130 @@ void mb86233_device::execute_run_impl(const u32 *mapped, const uint64_t *mapped_
     }
     const compiled_block_entry *blocks=trusted&&!options.single&&!sample_pc?compiled_blocks():nullptr;
     if(trusted&&!blocks){
+#if defined(DAYTONA_TGP_COMMAND36_REGIONS)
+        if(options.daytona_command36&&!sample_pc&&!options.native_jit&&!options.reference_counts&&
+           !options.packed_handlers&&m_fast_ram.low&&m_fast_ram.high){
+            // This alternate AOT table is selected only after verifying the entire
+            // uploaded DSP image and callback-free instruction fetches.
+            static const auto command36=[] {
+                std::array<compiled_entry,4096> table{};
+                std::copy_n(compiled_program(),table.size(),table.begin());
+                const auto region=[]<u16 First,u32... Words>() {
+                    static_assert((private_instruction(Words)&&...));
+                    static_assert(((Words>>26<0x10||Words>>26>0x1f||
+                                    private_register(Words>>24))&&...));
+                    constexpr int cycles=(private_cycles(Words)+...);
+                    constexpr u32 first[]={Words...};
+                    return +[](mb86233_device *cpu){
+                        if(cpu->m_ppc!=First||cpu->m_r!=1||cpu->m_stall||cpu->m_icount<cycles){
+                            cpu->execute_one(std::integral_constant<u32,first[0]>{});
+                            return;
+                        }
+                        (cpu->private_step<Words>(),...);
+                        cpu->m_pc=First+sizeof...(Words);
+                        cpu->m_ppc=cpu->m_pc-1;
+                        cpu->m_icount-=cycles;
+                        cpu->m_compiled_instructions+=sizeof...(Words)-1;
+                        cpu->m_block_instructions+=sizeof...(Words);
+                        ++cpu->m_blocks_run;
+                    };
+                };
+                const auto repeat=[]<u16 Address,u32 Word>() {
+                    return +[](mb86233_device *cpu){
+                        // Retain every external read and its precise guest timestamp.
+                        // Collapse repeated handler dispatch only while the original
+                        // instruction leaves the PC here and the slice can continue.
+                        constexpr auto word=std::integral_constant<u32,Word>{};
+                        unsigned count=1;
+                        cpu->execute_one(word);
+                        if(cpu->m_ppc==Address){
+                            while(cpu->m_icount>0&&cpu->m_pc==Address){
+                                cpu->m_ppc=cpu->m_pc++;
+                                cpu->execute_one(word);
+                                ++count;
+                            }
+                        }
+                        cpu->m_compiled_instructions+=count-1;
+                        if(count>1){
+                            cpu->m_block_instructions+=count;
+                            ++cpu->m_blocks_run;
+                        }
+                    };
+                };
+#define DAYTONA_REGION(first, ...) table[first].run=region.template operator()<first,__VA_ARGS__>();
+#define DAYTONA_REPEAT(address, word) table[address].run=repeat.template operator()<address,word>();
+                DAYTONA_TGP_COMMAND36_REGIONS(DAYTONA_REGION,DAYTONA_REPEAT)
+                const auto intake=[]<u16 First>(){
+                    static_assert(First==0x04d||First==0x054);
+                    constexpr int minimum=First==0x04d?7:4;
+                    constexpr u32 first_opcode=First==0x04d?0x1c1dc07fu:0x1c1f3214u;
+                    return +[](mb86233_device *cpu){
+                        if(cpu->m_ppc!=First||cpu->m_r!=1||cpu->m_stall||cpu->m_icount<minimum){
+                            cpu->execute_one(std::integral_constant<u32,first_opcode>{});
+                            return;
+                        }
+                        int done=0;
+                        if constexpr(First==0x04d){
+                            cpu->execute_one<true>(std::integral_constant<u32,0x1c1dc07fu>{});
+                            cpu->execute_one<true>(std::integral_constant<u32,0x3c000014u>{});
+                            cpu->execute_one<true>(std::integral_constant<u32,0x1c1f1815u>{});
+                            cpu->execute_one<true>(std::integral_constant<u32,0x1c1f320cu>{});
+                            cpu->execute_one<true>(std::integral_constant<u32,0x1c1f2014u>{});
+                            cpu->execute_one<true>(std::integral_constant<u32,0x1f7db800u>{});
+                            cpu->m_ppc=0x053;
+                            cpu->m_pc=0x054;
+                            cpu->execute_one<true>(std::integral_constant<u32,0xfe0000a1u>{});
+                            done=7;
+                        }
+                        if((First==0x054||cpu->m_pc==0x054)&&cpu->m_icount-done>=4){
+                            cpu->execute_one<true>(std::integral_constant<u32,0x1c1f3214u>{});
+                            cpu->execute_one<true>(std::integral_constant<u32,0x39000058u>{});
+                            cpu->execute_one<true>(std::integral_constant<u32,0x1f5db800u>{});
+                            cpu->m_ppc=0x057;
+                            cpu->m_pc=0x058;
+                            cpu->execute_one<true>(std::integral_constant<u32,0xbf624019u>{});
+                            done+=4;
+                            // All in-range entries are validated unconditional branches.
+                            if(cpu->m_icount>done&&cpu->m_pc>=0x058&&cpu->m_pc<=0x0a0){
+                                cpu->m_ppc=cpu->m_pc;
+                                cpu->m_pc=u16(compiled_program()[cpu->m_pc].opcode);
+                                ++done;
+                            }
+                        }
+                        cpu->m_icount-=done;
+                        cpu->m_compiled_instructions+=done-1;
+                        cpu->m_block_instructions+=done;
+                        ++cpu->m_blocks_run;
+                    };
+                };
+                constexpr std::array<u32,11> intake_words{
+                    0x1c1dc07f, 0x3c000014, 0x1c1f1815, 0x1c1f320c, 0x1c1f2014,
+                    0x1f7db800, 0xfe0000a1, 0x1c1f3214, 0x39000058, 0x1f5db800,
+                    0xbf624019
+                };
+                const bool exact_intake=
+                    std::equal(intake_words.begin(),intake_words.end(),table.begin()+0x04d,
+                               [](u32 word,const compiled_entry &entry){return entry.opcode==word;})&&
+                    std::all_of(table.begin()+0x058,table.begin()+0x0a1,
+                                [](const compiled_entry &entry){return entry.opcode>>16==0xbf60;});
+                if(options.daytona_fused_dispatch&&exact_intake){
+                    table[0x04d].run=intake.template operator()<0x04d>();
+                    table[0x054].run=intake.template operator()<0x054>();
+                }
+                if(options.daytona_repeat_moves&&table[0x0ea].opcode==0x1c1343a1u&&
+                   table[0x0f1].opcode==0x1c0f43a1u){
+                    table[0x0ea].run=&compiled_repeat_move<0x1c1343a1u,true>;
+                    table[0x0f1].run=&compiled_repeat_move<0x1c0f43a1u,true>;
+                }
+#undef DAYTONA_REPEAT
+#undef DAYTONA_REGION
+                return table;
+            }();
+            program=command36.data();
+            if(options.daytona_cached_dispatch&&mapped)
+                m_cached_daytona_dispatch=program;
+        }
+#endif
         // The bus guarantees this revision cannot change within run(). The
         // complete image was checked above, so individual native handlers need
         // neither virtual instruction fetches nor repeated opcode guards.
@@ -1677,7 +1837,7 @@ void mb86233_device::execute_run_impl(const u32 *mapped, const uint64_t *mapped_
 #undef VF2_TGP_HELPER
 
 #if defined(VF2_TGP_AOT)
-template<u32 Opcode> void mb86233_device::compiled_repeat_move(mb86233_device *cpu)
+template<u32 Opcode,bool TrustedRepeat> void mb86233_device::compiled_repeat_move(mb86233_device *cpu)
 {
     constexpr bool high_to_low=Opcode==0x1c1343a1u;
     constexpr bool low_to_high=Opcode==0x1c0f43a1u;
@@ -1686,7 +1846,8 @@ template<u32 Opcode> void mb86233_device::compiled_repeat_move(mb86233_device *c
     static_assert(high_to_low||low_to_high||ram_fill||a_fill);
     // A trusted, unobserved slice can take consecutive pure MOVs at once.
     // Keep each word's forward read/write order even if RAM windows alias.
-    if(cpu->m_native_matrix_allowed&&cpu->m_icount>0&&cpu->m_r!=1&&!cpu->m_stall&&cpu->m_fast_ram.low){
+    if((TrustedRepeat||cpu->m_native_matrix_allowed)&&cpu->m_icount>0&&cpu->m_r!=1&&
+       !cpu->m_stall&&cpu->m_fast_ram.low&&cpu->m_fast_ram.high){
         const unsigned remaining=cpu->m_r?cpu->m_r:256;
         const unsigned count=std::min(unsigned(cpu->m_icount),remaining);
         const unsigned x0=cpu->m_x0,x1=cpu->m_x1;
@@ -1708,6 +1869,10 @@ template<u32 Opcode> void mb86233_device::compiled_repeat_move(mb86233_device *c
             cpu->m_icount-=int(count);
             cpu->m_compiled_instructions+=count-1; // The dispatch already counted one MOV.
             cpu->m_r=count==remaining?1:u8(remaining-count);
+            if constexpr(TrustedRepeat){
+                ++cpu->m_blocks_run;
+                cpu->m_block_instructions+=count;
+            }
             if(count!=remaining)cpu->m_pc=cpu->m_ppc;
             return;
         }

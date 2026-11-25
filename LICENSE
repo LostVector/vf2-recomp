@@ -23,7 +23,7 @@ SOFTWARE.
 ---
 This licence covers the code in this repository written for this project. It does not cover:
 
-- the game: Virtua Fighter 2 is not included, and its names belong to SEGA;
+- the games: Virtua Fighter 2 and Daytona USA are supplied by the user, and their names belong to SEGA;
 - code from or ported from MAME, which stays under MAME's BSD-3-Clause licence with its copyright
   holders: third_party/mame/ and the files in src/ whose headers say they come from or are ported
   from MAME (third_party/mame/README.md lists them);

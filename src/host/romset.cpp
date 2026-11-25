@@ -2,6 +2,8 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <initializer_list>
+#include <span>
 #include <zlib.h>
 
 namespace romset {
@@ -96,9 +98,9 @@ const region_def REGIONS[N_REGIONS] = {
 	{ "video_unk", 0x200000, 0 },
 };
 // ROM_LOAD32_WORD (16-bit halves of 32-bit words), ROM_LOAD16_WORD_SWAP, ROM_LOAD32_BYTE
-enum kind { WORD32, WORDSWAP, BYTE32 };
+enum kind { WORD32, WORDSWAP, BYTE32, RAW };
 struct rom { const char *name; uint32_t crc; region_id region; uint32_t offset; kind k; };
-const rom ROMS[] = {
+const rom VF2_ROMS[] = {
 	{ "epr-18385.12", 0x78ed2d41, MAINCPU, 0x000000, WORD32 },
 	{ "epr-18386.13", 0x3418f428, MAINCPU, 0x000002, WORD32 },
 	{ "epr-18387.14", 0x124a8453, MAINCPU, 0x040000, WORD32 },
@@ -126,15 +128,59 @@ const rom ROMS[] = {
 	{ "mpr-17572.32", 0x4febecc8, SAMPLES, 0x200000, WORDSWAP },
 	{ "mpr-17571.36", 0x51caa584, SAMPLES, 0x400000, WORDSWAP },
 	{ "mpr-17570.37", 0xbccd324b, SAMPLES, 0x600000, WORDSWAP },
+};
+const rom CPU_BOARD_ROMS[] = {
 	{ "opr-14742a.45", 0x90c6b117, COPRO_TABLES, 0x000000, WORD32 },
 	{ "opr-14743a.46", 0xae7f446b, COPRO_TABLES, 0x000002, WORD32 },
 	{ "opr-14744.58", 0x730ea9e0, OTHER_DATA, 0x000000, WORD32 },
 	{ "opr-14745.59", 0x4c934d96, OTHER_DATA, 0x000002, WORD32 },
 	{ "opr-14746.62", 0x2a266cbd, OTHER_DATA, 0x040000, WORD32 },
 	{ "opr-14747.63", 0xa4ad5e19, OTHER_DATA, 0x040002, WORD32 },
+};
+const rom VF2_VIDEO_BOARD_ROMS[] = {
 	{ "mpr-16310.15", 0xc078a780, VIDEO_UNK, 0x000000, BYTE32 },
 	{ "mpr-16311.16", 0x452a492b, VIDEO_UNK, 0x000001, BYTE32 },
 	{ "mpr-16312.14", 0xa25fef5b, VIDEO_UNK, 0x000002, BYTE32 },
+};
+
+// Original Model 2, MAME's daytona parent set (Revision A).
+const rom DAYTONA_ROMS[] = {
+	{ "epr-16722a.12", 0x48b94318, MAINCPU, 0x000000, WORD32 },
+	{ "epr-16723a.13", 0x8af8b32d, MAINCPU, 0x000002, WORD32 },
+	{ "mpr-16528.10", 0x9ce591f6, MAIN_DATA, 0x000000, WORD32 },
+	{ "mpr-16529.11", 0xf7095eaf, MAIN_DATA, 0x000002, WORD32 },
+	{ "mpr-16808.8", 0x44f1f5a0, MAIN_DATA, 0x400000, WORD32 },
+	{ "mpr-16809.9", 0x37a2dd12, MAIN_DATA, 0x400002, WORD32 },
+	{ "epr-16724a.6", 0x469f10fd, MAIN_DATA, 0x800000, WORD32 },
+	{ "epr-16725a.7", 0xba0df8db, MAIN_DATA, 0x800002, WORD32 },
+	{ "mpr-16537.ic28", 0x36b7c35a, COPRO_DATA, 0x000000, WORD32 },
+	{ "mpr-16536.ic29", 0x6d6afed9, COPRO_DATA, 0x000002, WORD32 },
+	{ "mpr-16523.ic16", 0x2f484d42, POLYGONS, 0x000000, WORD32 },
+	{ "mpr-16518.ic20", 0xdf683bf7, POLYGONS, 0x000002, WORD32 },
+	{ "mpr-16524.ic17", 0x34658bd7, POLYGONS, 0x400000, WORD32 },
+	{ "mpr-16519.ic21", 0xfacd1c81, POLYGONS, 0x400002, WORD32 },
+	{ "mpr-16525.ic18", 0xfb517521, POLYGONS, 0x800000, WORD32 },
+	{ "mpr-16520.ic22", 0xd66bd9bd, POLYGONS, 0x800002, WORD32 },
+	{ "mpr-16772.ic19", 0x770ed912, POLYGONS, 0xc00000, WORD32 },
+	{ "mpr-16771.ic23", 0xa2205124, POLYGONS, 0xc00002, WORD32 },
+	{ "mpr-16522.25", 0x55d39a57, TEXTURES, 0x000000, WORD32 },
+	{ "mpr-16521.24", 0xaf1934fb, TEXTURES, 0x000002, WORD32 },
+	{ "mpr-16770.27", 0xf9fa7bfb, TEXTURES, 0x800000, WORD32 },
+	{ "mpr-16769.26", 0xe57429e9, TEXTURES, 0x800002, WORD32 },
+	{ "epr-16720.7", 0x8e73cffd, AUDIOCPU, 0x000000, WORDSWAP },
+	{ "epr-16721.8", 0x1bb3b7b7, AUDIOCPU, 0x020000, WORDSWAP },
+	{ "mpr-16491.32", 0x89920903, SAMPLES, 0x000000, RAW },
+	{ "mpr-16492.33", 0x459e701b, SAMPLES, 0x200000, RAW },
+	{ "mpr-16493.4", 0x9990db15, SAMPLES, 0x400000, RAW },
+	{ "mpr-16494.5", 0x600e1d6c, SAMPLES, 0x600000, RAW },
+	{ "epr-14869c.25", 0x24b68e64, IOCPU, 0, RAW },
+};
+
+const region_def DAYTONA_REGIONS[N_REGIONS] = {
+	{ "maincpu", 0x200000, 0 }, { "main_data", 0x2000000, 0 }, { "copro_data", 0x800000, 0 },
+	{ "polygons", 0x1000000, 0 }, { "textures", 0x1000000, 0 }, { "audiocpu", 0x40000, 0 },
+	{ "samples", 0x800000, 0 }, { "copro_tgp_tables", 0x40000, 0 }, { "other_data", 0x80000, 0 },
+	{ "video_unk", 0, 0 },
 };
 
 void place(std::vector<uint8_t> &r, const rom &ro, const std::vector<uint8_t> &d)
@@ -150,22 +196,28 @@ void place(std::vector<uint8_t> &r, const rom &ro, const std::vector<uint8_t> &d
 	case BYTE32:
 		for (size_t i = 0; i < d.size() && off + 4 * i < r.size(); i++) r[off + 4 * i] = d[i];
 		break;
+	case RAW:
+		if (ro.region == IOCPU) r = d;
+		else if (off <= r.size() && d.size() <= r.size() - off)
+			memcpy(r.data() + off, d.data(), d.size());
+		break;
 	}
 }
 
 } // namespace
 
-const char *region_name(int r) { return r >= 0 && r < N_REGIONS ? REGIONS[r].name : "?"; }
+const char *region_name(int r) { return r == IOCPU ? "iocpu" : r >= 0 && r < N_REGIONS ? REGIONS[r].name : "?"; }
 
-result load(const std::string &path)
+static result load_set(const std::string &path, const region_def (&regions)[N_REGIONS],
+	std::initializer_list<std::span<const rom>> lists, const char *description)
 {
 	result res;
 	zip z;
 	if (!z.open(path)) { res.error = "Couldn't read " + path + " as a zip file."; return res; }
-	for (int r = 0; r < N_REGIONS; r++) res.regions[r].assign(REGIONS[r].size, REGIONS[r].fill);
+	for (int r = 0; r < N_REGIONS; r++) res.regions[r].assign(regions[r].size, regions[r].fill);
 	int bad = 0;
 	std::vector<uint8_t> d;
-	for (const rom &ro : ROMS) {
+	for (auto list : lists) for (const rom &ro : list) {
 		rom_status st{ ro.name, ro.crc, ro.region, ro.offset, rom_status::OK };
 		// by CRC first (any name), then report a same-named file with other contents
 		const entry *e = nullptr;
@@ -177,15 +229,39 @@ result load(const std::string &path)
 		} else if (!z.read(*e, d)) {
 			st.state = rom_status::DAMAGED;
 		} else {
-			place(res.regions[ro.region], ro, d);
+			place(ro.region == IOCPU ? res.io_firmware : res.regions[ro.region], ro, d);
 		}
 		if (st.state != rom_status::OK) {
-			if (!bad++) res.error = "This isn't a complete Virtua Fighter 2 (Version 2.1) set, MAME's \"vf2\". Not usable:";
+			if (!bad++) res.error = description;
 			res.error += std::string(" ") + ro.name;
 		}
 		res.roms.push_back(st);
 	}
 	res.ok = bad == 0;
+	return res;
+}
+
+result load(const std::string &path)
+{
+	return load_set(path, REGIONS, {VF2_ROMS, CPU_BOARD_ROMS, VF2_VIDEO_BOARD_ROMS},
+		"This isn't a complete Virtua Fighter 2 (Version 2.1) set, MAME's \"vf2\". Not usable:");
+}
+
+result load_daytona(const std::string &path)
+{
+	result res = load_set(path, DAYTONA_REGIONS, {DAYTONA_ROMS, CPU_BOARD_ROMS},
+		"Missing or invalid ROMs for Daytona USA (Revision A), MAME's \"daytona\":");
+	if (res.ok) {
+		auto &data = res.regions[MAIN_DATA];
+		for (size_t offset = 0x900000; offset < 0x1000000; offset += 0x100000)
+			memcpy(data.data() + offset, data.data() + 0x800000, 0x100000);
+		// Record the replication so the machine can fold reads to the source and
+		// discard the seven mirror pages after the region is hashed. The copies
+		// stay in the buffer for now: the ROM hash is a whole-buffer hash and must
+		// see them.
+		res.mirror_region = MAIN_DATA;
+		res.mirror_base = 0x800000; res.mirror_size = 0x100000; res.mirror_end = 0x1000000;
+	}
 	return res;
 }
 

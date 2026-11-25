@@ -27,10 +27,22 @@ inline bool sound_guard(model2a &m,std::string &error){
 }
 inline bool save(model2a &m,const std::string &path,std::string &error){
     if(!sound_guard(m,error))return false;
-    std::vector<uint8_t> core,geometry;m.save_state(core);m.video().save_geometry(geometry);
-    header h;h.rom=m.rom_hash();h.core_size=core.size();h.geometry_size=geometry.size();h.crc=checksum(core,geometry);
+    // The core is streamed straight to the file: building its 7 MB buffer
+    // exhausts the Mini's RAM beside the render caches (the kernel kills the
+    // process). The geometry part is small (a few hundred KB) and stays a vector.
     FILE *f=std::fopen(path.c_str(),"wb");if(!f){error="Cannot create checkpoint "+path;return false;}
-    bool ok=std::fwrite(&h,1,sizeof h,f)==sizeof h&&std::fwrite(core.data(),1,core.size(),f)==core.size()&&std::fwrite(geometry.data(),1,geometry.size(),f)==geometry.size();
+    header h;
+    bool ok=std::fwrite(&h,1,sizeof h,f)==sizeof h;
+    size_t core_size=0;
+    // The CRC is accumulated as the bytes are written, so nothing is read back.
+    m2::FileStateWriter w(f);
+    if(ok)ok=m.save_state_file(w,core_size);
+    std::vector<uint8_t> geometry;
+    if(ok){m.video().save_geometry(geometry);if(!geometry.empty())w.bytes(geometry.data(),geometry.size());}
+    ok=ok&&!w.failed;
+    if(ok)ok=std::fflush(f)==0;
+    h.rom=m.rom_hash();h.core_size=core_size;h.geometry_size=geometry.size();h.crc=w.crc;
+    if(ok)ok=std::fseek(f,0,SEEK_SET)==0&&std::fwrite(&h,1,sizeof h,f)==sizeof h;
     if(std::fclose(f))ok=false;
     if(!ok)error="Checkpoint write failed";return ok;
 }
@@ -44,6 +56,9 @@ inline bool load(model2a &m,const std::string &path,std::string &error){
     ok=std::fread(core.data(),1,core.size(),f)==core.size()&&std::fread(geometry.data(),1,geometry.size(),f)==geometry.size()&&std::fgetc(f)==EOF;
     std::fclose(f);
     if(!ok||checksum(core,geometry)!=h.crc){error="Checkpoint is truncated or has a CRC mismatch";return false;}
+    if(std::getenv("VF2_CHECK_HASH"))std::fprintf(stderr,"CHECK file core %016llx geometry %016llx\n",
+        (unsigned long long)m2::state_hash(core.data()+model2a::STATE_HEADER,core.size()-model2a::STATE_HEADER),
+        (unsigned long long)m2::state_hash(geometry.data(),geometry.size()));
     if(!m.load_state(core.data(),core.size())||!m.video().load_geometry(geometry.data(),geometry.size())){error="Checkpoint state validation failed";return false;}
     return true;
 }

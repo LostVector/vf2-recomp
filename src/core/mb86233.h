@@ -231,6 +231,8 @@ private:
 	uint64_t m_native_matrices=0;
 	uint64_t m_checked_revision=0;
 	const u32 *m_checked_program=nullptr;
+    const compiled_entry *m_cached_daytona_dispatch=nullptr;
+    bool m_cached_daytona_reported=false;
 	bool m_block_program_matches=false;
     // Keep the original hot DSP registers at their compact ARM load offsets.
     // Deferred execution bookkeeping belongs after the architectural fields.
@@ -264,7 +266,7 @@ private:
 	template<bool Private> void write_mem_internal_1(u32 r, u32 v, bool bank);
 	void write_mem_external_1(u32 r, u32 v);
 	void write_mem_io_1(u32 r, u32 v);
-    template<u32 Opcode> static void compiled_repeat_move(mb86233_device *cpu);
+    template<u32 Opcode,bool TrustedRepeat=false> static void compiled_repeat_move(mb86233_device *cpu);
     template<unsigned FirstColumn,unsigned SecondColumn,u32 Opcode> static void rotation_entry(mb86233_device *cpu);
     template<unsigned FirstColumn,unsigned SecondColumn> bool native_rotation();
     template<unsigned FirstColumn,unsigned SecondColumn> bool start_native_rotation_pending();

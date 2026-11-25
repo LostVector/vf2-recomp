@@ -1,0 +1,21 @@
+# Intermediate, automatic transmission, from a cold cabinet.
+# A short right press selects the second course at the confirm.
+# With the 256 us DSP quantum, tick 2250 shows canyon traffic after the gate.
+
+at 350
+press coin1 8
+at 380
+press start1 8
+at 415
+press steerright 6
+at 420
+press accelerator 12
+at 510
+press accelerator 12
+at 690
+hold accelerator
+
+at 1960
+press steerright 11
+at 2010
+press steerleft 7

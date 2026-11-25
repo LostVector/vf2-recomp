@@ -38,6 +38,7 @@ void m68000_device::do_post_run()
 
 void m68000_device::execute_run()
 {
+	const u16 *const voice_ram = m_daytona_voice_ram;
 	m_icount -= m_count_before_instruction_step;
 	if(m_icount < 0) {
 		m_count_before_instruction_step = -m_icount;
@@ -50,6 +51,31 @@ void m68000_device::execute_run()
 			(this->*(m_handlers_p[m_inst_state]))();
 
 		while(m_icount > 0) {
+            // A whole inactive iteration consists only of ROM prefetches
+            // and a private RAM flag read. Leave its final iteration to the
+            // ordinary microcode to reconstruct all prefetch and ALU state.
+            if(voice_ram && m_icount>104 &&
+               m_ird==0x082c && (m_pc==0x1542||m_pc==0x15c2) &&
+               m_inst_state==m_decode_table[0x082c] && !m_inst_substate &&
+               !m_next_state && !m_int_next_state && !m_post_run &&
+               !(m_sr&SR_T) && !on_instruction && m_dbin==0 && m_au==m_pc+2){
+                const u32 count=u16(m_da[4]);
+                const u32 base=m_pc==0x1542?0xf01500:0xf01618;
+                const u32 address=m_da[12];
+                if(count<=27 && address==base+(27-count)*10){
+                    constexpr int loop_cycles=52;
+                    const unsigned limit=std::min(count,unsigned((m_icount-1)/loop_cycles));
+                    const u16 *flags=voice_ram+((address-0xf00000)>>1);
+                    unsigned inactive=0;
+                    while(inactive<limit&&!(flags[inactive*5]&0x0100))++inactive;
+                    if(inactive>1){
+                        const unsigned skipped=inactive-1;
+                        m_da[12]+=10*skipped;
+                        set_16l(m_da[4],u16(count-skipped));
+                        m_icount-=int(skipped)*loop_cycles;
+                    }
+                }
+            }
 			if(m_inst_state >= S_first_instruction) {
 				m_ipc = m_pc - 2;
 				m_irdi = m_ird;

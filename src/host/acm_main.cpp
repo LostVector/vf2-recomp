@@ -303,7 +303,9 @@ int main(int argc,char **argv){
         if(unlink(rom.c_str())){std::perror("release RAM ROM");return 1;}
         std::fprintf(stderr,"Released temporary ROM archive after decoding\n");
     }
-    model2a machine(std::move(roms));machine.release_unused_roms();machine.set_sound(!no_sound_board);
+    const char *rom_dedup=std::getenv("VF2_ROM_DEDUP");
+    model2a machine(std::move(roms),true,!rom_dedup||std::strcmp(rom_dedup,"0")!=0);
+    machine.release_unused_roms();machine.set_sound(!no_sound_board);
     // Match the desktop frontend: schedule UART byte arrivals rather than a
     // million idle clock events per emulated second. The bit-level mode is
     // retained by vf2run for exact reference validation.

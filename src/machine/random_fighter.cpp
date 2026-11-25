@@ -186,7 +186,7 @@ class tex_decoder : public mame_bus32
 {
 public:
 	struct unit { u8 sheet; u32 at; u16 v; };   // (a write: sheet, its 16-bit unit's index, the value)
-	tex_decoder(const std::vector<u8> &prog, const std::vector<u8> &data) : m_prog(prog), m_data(data), m_ram(0x100000) {}
+	tex_decoder(std::span<const u8> prog, std::span<const u8> data) : m_prog(prog), m_data(data), m_ram(0x100000) {}
 	// a block's data (its word in a set's list) placed at x, y: false if it didn't finish
 	bool decode(u32 data_at, int x, int y, std::vector<unit> &out)
 	{
@@ -241,7 +241,7 @@ public:
 		return burst ? i960_cpu_device::BURST : 0;
 	}
 private:
-	const std::vector<u8> &m_prog, &m_data;
+	std::span<const u8> m_prog, m_data;
 	std::vector<u8> m_ram;
 	std::unique_ptr<i960_device> m_cpu;
 	std::vector<unit> *m_out = nullptr;
@@ -271,7 +271,8 @@ public:
 	bool stale = false;    // (forget's: everything forgotten, the ROMs read again at the next use)
 	void forget();
 	model2a &m;
-	std::vector<u8> &prog, &data;
+	std::vector<u8> &prog;
+	std::span<u8> data;
 	std::vector<u8> prog0, data0;   // (the ROMs' bytes as loaded, the part read: tables and records)
 	bool known = false, on = false, base_on = false;
 	int mode[2] = { 0, 0 };         // (each player's: 0 the select as ever, 1 random, 2 a seed's)
@@ -397,7 +398,7 @@ public:
 		u32 head_set = 0;                          // (its head's texture set)
 	};
 	tex_side tex[2];
-	std::vector<u8> &texrom;
+	std::span<u8> texrom;
 	std::map<u32, u16> tex_was;   // (each texture ROM u16 changed, as loaded)
 	u16 trd(u32 i) const { u16 v = 0; if (2 * size_t(i) + 2 <= texrom.size()) memcpy(&v, &texrom[2 * size_t(i)], 2); return v; }
 	u16 trd0(u32 i) const { const auto it = tex_was.find(i); return it != tex_was.end() ? it->second : trd(i); }
@@ -440,7 +441,7 @@ random_fighters &model2a::randoms()
 }
 
 random_fighters::random_fighters(model2a &board)
-	: m(board), prog(board.m_roms.regions[romset::MAINCPU]), data(board.m_roms.regions[romset::MAIN_DATA]), texrom(board.m_roms.regions[romset::TEXTURES])
+	: m(board), prog(board.m_roms.regions[romset::MAINCPU]), data(board.m_data), texrom(board.m_texture_rom)
 {
 	for (int &h : hair_hue) h = -1;
 	snapshot();

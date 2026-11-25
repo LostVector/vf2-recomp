@@ -1,0 +1,36 @@
+# Two players close distance, trade attacks and guards, then back off.
+# Frames are relative to loading a versus checkpoint.
+at 30
+press p1right+p2left 15
+wait 8
+press p1punch+p2guard 5
+wait 22
+press p2kick+p1guard 5
+wait 24
+press p1down+p1kick 6
+wait 22
+press p2down+p2punch 6
+wait 28
+press p1left+p2right 12
+wait 26
+press p1right+p2left 12
+wait 10
+press p1kick+p2guard 5
+wait 25
+press p2punch+p1guard 5
+wait 24
+press p1up+p1punch 5
+wait 28
+press p2up+p2kick 5
+wait 30
+press p1punch+p2kick 5
+wait 32
+press p1left+p2right 10
+wait 30
+press p1right+p2left 12
+wait 8
+press p1guard+p2kick 5
+wait 25
+press p1punch+p2guard 6
+wait 24
+press p2down+p2kick 5

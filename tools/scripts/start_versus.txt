@@ -1,0 +1,19 @@
+# Buy two credits, then join with both players during character selection.
+at 1000
+press coin1 6
+wait 20
+press coin1 6
+wait 20
+press coin1 6
+wait 20
+press coin1 6
+wait 60
+press start1 6
+wait 60
+press start2 6
+wait 100
+press p1right 4
+wait 20
+press p1punch 4
+wait 20
+press p2punch 4

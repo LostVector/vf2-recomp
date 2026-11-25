@@ -54,6 +54,9 @@ struct runtime
 	stats st;
 	bool count_interp = false;   // count the instructions the interpreter runs (and where: interp_pc)
 	std::vector<uint32_t> interp_pc;   // per address / 4 (when counting)
+	// Optional diagnostic counters. Storage stays fixed while native code embeds its addresses.
+	std::vector<uint32_t> native_pc;
+	std::vector<uint8_t> native_inline;
 
 	// The native code (i960_native.h): one piece, entered at an instruction's label
 	using nfn_t = void (*)(i960_device *, uintptr_t);
@@ -81,6 +84,8 @@ struct runtime
 	// The interpreter's execute_run, with the recompiled code
 	void execute(i960_device &c);
 	static void stop(i960_device &);   // a dropped function: back to the loop (the interpreter)
+    void *timer_poll_context=nullptr;
+    void (*collapse_timer_poll)(void *,uint32_t,uint32_t &,int &)=nullptr;
 };
 
 // Goes on at IP: the function there, or back to the loop

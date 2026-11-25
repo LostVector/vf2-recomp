@@ -1,5 +1,5 @@
-// MAME's Intel 80960KB core (third_party/mame/i960; its members made protected, nothing else
-// changed) on the shim's plain bus, with named access to the registers it publishes through
+// MAME's Intel 80960KB core (third_party/mame/i960) on the shim's plain bus,
+// with named access to the registers it publishes through
 // state_add.
 //
 // The recompiler (src/rec) runs the game's code in the interpreter's place when one is attached
@@ -31,6 +31,10 @@ public:
 	u32 ip() const { return reg(I960_IP); }       // the next instruction
 	u32 pip() const { return reg(I960_PIP); }     // the instruction being executed
 	u32 pc_reg() const { return reg(I960_PC); }   // process controls (priority in bits 16-20)
+	// Native device transactions may spend virtual wait cycles without running
+	// a polling loop. The caller bounds this by the current slice's remainder.
+	int remaining_cycles() const { return m_icount; }
+	void wait_cycles(int cycles) { m_icount-=cycles; }
 
 	// The recompiled code (src/rec/i960_rec.h), or null: the interpreter
 	void set_rec(i960rec::runtime *r) { m_rec = r; }

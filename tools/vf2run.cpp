@@ -28,6 +28,7 @@
 //     --copro-log file   the i960's writes to the TGP ("w offset value") and the values it reads back
 //     --script file      inputs from a script (src/host/input_script.h); runs at least to its end
 //     --2d               PNGs of the tile layers only (no polygons)
+//     --render-all       render every frame without writing images (device benchmark)
 //     --scale N          PNGs at N times the arcade's resolution (the 3D drawn at it, the 2D
 //                        enlarged), as the game's render scale; the default 1 is MAME's picture
 //     --aspect A         the picture's shape, as the game's: 4:3 (default, MAME's), 16:10, 16:9,
@@ -72,6 +73,9 @@
 #include <filesystem>
 #include <set>
 #include <tuple>
+#ifdef __linux__
+#include <sys/resource.h>
+#endif
 
 static std::set<uint64_t> parse_list(const char *s)
 {
@@ -115,7 +119,7 @@ int main(int argc, char **argv)
 	}
 	uint64_t frames = strtoull(argv[2], nullptr, 10);
 	std::set<uint64_t> png, dump, trace_frames;
-	bool png_all = false, frames_log = false, layers = false;
+	bool png_all = false, frames_log = false, layers = false, render_all = false;
 	std::string out = "build/frames", trace_path, thunks_path, copro_path, tgp_trace_path, script_path;
 	bool only_2d = false, free_play = false, sound = false, byte_link = false;
 	int version = -1;
@@ -152,6 +156,7 @@ int main(int argc, char **argv)
 		else if (a == "--level") level = float(atof(next()));
 		else if (a == "--dump") dump = parse_list(next());
 		else if (a == "--frames-log") frames_log = true;
+		else if (a == "--render-all") render_all = true;
 		else if (a == "--layers") layers = true;
 		else if (a == "--thunks") thunks_path = next();
 		else if (a == "--copro-log") copro_path = next();
@@ -407,6 +412,7 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		// the frame just drawn is frame f (MAME's frame_number before it counts it)
+		if (render_all) m.render(!only_2d);
 		if (!ready_seen && (m.peek32(0x00500068) & 0x80000000)) {
 			ready_seen = true;
 			m.on_milestone("runtime-ready flag 0x500068[31] set");
@@ -562,5 +568,10 @@ int main(int argc, char **argv)
 		for (auto &[a, c] : m.m_unmapped) if (n++ < 24) fprintf(stderr, " %s%08x x%d", (a & 1) ? "w" : "r", a & ~1u, c);
 		fprintf(stderr, "\n");
 	}
+#ifdef __linux__
+	struct rusage resources{};
+	if (getrusage(RUSAGE_SELF, &resources) == 0)
+		fprintf(stderr, "peak RSS %ld KiB; render every frame %s\n", resources.ru_maxrss, render_all ? "yes" : "no");
+#endif
 	return 0;
 }

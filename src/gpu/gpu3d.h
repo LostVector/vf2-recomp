@@ -53,6 +53,10 @@ struct gpu3d_rams
 	const uint16_t *xlat = nullptr;// colorxlat, 0x6000
 	const uint8_t *gamma = nullptr;// 256
 	uint32_t gen[5] = {};          // tex0, tex1, luma, xlat, (gamma: unused)
+	// Optional per-4KB-page revisions, advanced on every write and on full
+	// invalidation. Null preserves the whole-bank generation contract above.
+	static constexpr size_t texture_page_words=1024, texture_pages=512;
+	const uint32_t *tex_page_gen[2] = {};
 };
 
 // A polygon's flat colour (step 1's, for pictures of the coverage)
@@ -70,8 +74,16 @@ enum class gpu3d_quality { exact, fast };
 // share drawn (premultiplied). edge: Low's antialiasing (model2a::edge_smooth) on the picture at
 // its scale, a pixel beside the 3D taking the 2D beneath (the board's picture_parts: the backdrop,
 // padded by pad, and the layers over it; at the arcade's resolution, w2d wide), opaque once blended.
+class gpu3d_geometry_frame;
+
 struct gpu3d_frame
 {
+    // Native GLES2 composition hooks, called while the target framebuffer is
+    // bound. Underlay preserves its colour beneath 3D; overlay runs afterward.
+    bool (*underlay)(void *)=nullptr;
+    bool (*overlay)(void *)=nullptr;
+    void *layers=nullptr;
+    const gpu3d_geometry_frame *mesh_scene=nullptr;
 	int w = 0, h = 0, scale = 1, ss = 1;
 	bool edge = false;
 	const uint32_t *backdrop = nullptr, *mid = nullptr;
@@ -107,6 +119,14 @@ public:
 	// RAMs are read (copied) here: the caller may change them once it returns. False: not drawn
 	// (an error: the caller goes back to the CPU).
 	virtual bool submit(const gpu3d_poly *polys, size_t count, const gpu3d_frame &f, int target) = 0;
+	// Optional CPU-only geometry preparation for the next submit. Input values
+	// must remain unchanged until submit; GPU RAM uploads still happen there.
+	virtual bool prepare_cpu(const gpu3d_poly *, size_t, const gpu3d_frame &) { return true; }
+    // Optional complete CPU frame planning, including immutable RAM snapshots.
+    // No GPU resource is mutated here. Inputs remain unchanged until submit;
+    // set_rams is still called by the host after waiting for the GPU fence.
+    virtual bool prepare_frame_cpu(const gpu3d_poly *p,size_t n,const gpu3d_frame &f,const gpu3d_rams &){return prepare_cpu(p,n,f);}
+
 	// The last submit finished: its GPU time and the CPU's time setting it up (ms). False: it failed.
 	virtual bool finish(double *gpu_ms = nullptr, double *cpu_ms = nullptr) = 0;
 	virtual bool busy() const = 0;   // a submit not finished yet
@@ -134,6 +154,11 @@ std::unique_ptr<gpu3d> gpu3d_create_metal_layer(void *ca_metal_layer);
 // own when null (tools: no window). The x86-64 CPU renderer's pictures. Null if it can't.
 struct SDL_GPUDevice;
 std::unique_ptr<gpu3d> gpu3d_create_sdlgpu(SDL_GPUDevice *dev = nullptr);
+// OpenGL ES 2.0 raster backend for Mali-400 and other legacy GLES devices.
+// Requires a current EGL/GLES2 context. target_handle is a GLuint texture name
+// encoded as uintptr_t; it belongs to that context. Uses hardware rasterization
+// (fast quality), not the compute-based exact desktop rasterizer.
+std::unique_ptr<gpu3d> gpu3d_create_gles2();
 // (its renderer made on another thread from now, for gpu3d_create_metal_layer to take: the start's
 // head start, while the game boots)
 void gpu3d_metal_prewarm();

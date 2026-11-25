@@ -9,6 +9,7 @@
 // for the MIDI link the Model 2 main board talks to the sound board through.
 #pragma once
 #include "scspdsp.h"
+#include "../core/wide_int.h"
 #include <cmath>
 #include <cstdlib>
 #include <functional>
@@ -20,7 +21,7 @@
 class scsp_device
 {
 public:
-	using attotime = unsigned __int128;   // attoseconds
+	using attotime = vf2::uint128_t;   // attoseconds
 	static constexpr attotime NEVER = 0;  // timer_adjust's delay for "never" (a disable)
 
 	// What the board gives the chip: its RAM (shared with the 68000), and the framework's services
@@ -50,6 +51,10 @@ public:
 	void timer_fired(int timer);
 	// Brings the stream up to now (sound_stream::update)
 	void update();
+	// Start the stream at the current time. A loaded state carries the board's clock
+	// but not its sample history; without this the first update would generate every
+	// sample since power-on in one block.
+	void start_stream_now() { m_written = m_host.sample_index(); }
 
 	// The samples made so far, stereo pairs as MAME's stream holds them (-1..1, before the
 	// output gain), and the output gain (MVOL / 15).

@@ -10,6 +10,7 @@
 #include <functional>
 #include "mame_lite.h"
 #include "poly.h"
+#include "../gpu/geometry_job.h"
 #include <memory>
 
 class model2_video;
@@ -23,6 +24,7 @@ inline uint32_t rgb_t(uint32_t r, uint32_t g, uint32_t b) { return 0xff000000 | 
 class bitmap_ind8
 {
 public:
+
 	bitmap_ind8(int w, int h) : m_w(w), m_pix(size_t(w) * h, 0) {}
 	void allocate(int w, int h) { m_w = w; m_pix.assign(size_t(w) * h, 0); }
 	uint8_t &pix(int y, int x = 0) { return m_pix[size_t(y) * m_w + x]; }
@@ -63,10 +65,15 @@ struct m2_poly_extra_data
 class model2_renderer;
 struct gpu3d_poly;
 struct gpu3d_rams;
-
+struct gpu3d_camera_poly;
+struct gpu3d_compact_camera_poly;
+struct gpu3d_shared_camera_list;
+class gpu3d_geometry_frame;
 class model2_video
 {
 public:
+    u64 direct_geometry_polygons()const{return m_direct_geometry_polygons;}
+
 	struct plane;
 	struct texture_parameter;
 	struct polygon;
@@ -80,9 +87,18 @@ public:
 				 u16 *colorxlat, u8 *gamma, const u8 *texture_rom, size_t texture_rom_bytes,
 				 const u8 *polygon_rom, size_t polygon_rom_bytes);
 	~model2_video();
-
 	// screen_vblank: the geometrizer runs through the display list in buffer RAM
 	void geo_parse();
+    // The geometry engine owns its state until materialized. Camera packets
+    // keep mutable palette/texture rendering outside this execution stage.
+    bool geometry_jobs(geometry_execution mode);
+    void mark_geometry_page(uint32_t byte_offset){m_geometry_dirty_pages|=uint32_t(1)<<(byte_offset/4096);}
+    void invalidate_geometry_pages(){m_geometry_dirty_pages=~uint32_t(0);}
+    bool observe_geometry_worker(std::function<void()> observer);
+    void geometry_wait();
+    void reset_geometry_job_stats();
+    void report_geometry_jobs(FILE *out);
+    uint64_t geometry_job_count();
 	// screen_update's 3D part: frame_end() at the end of every vblank, when MAME draws (the
 	// polygons, or nothing new if the geometrizer hasn't run), composite() puts it on a screen
 	// (or the framebuffer, in render test mode)
@@ -115,6 +131,11 @@ public:
 	void export_shown(std::vector<gpu3d_poly> &out) const;
 	// any picture's list (0-3: shown_index's, smooth_layer's), for the GPU's drawing in the game
 	void export_picture(int picture, std::vector<gpu3d_poly> &out) const;
+	// Native camera-space handoff: clipping/projection can run after the board
+	// advances. Palette values are captured here, before any concurrent writes.
+	bool camera_packets(bool on); // startup configuration; normal camera, no frame delay
+	bool capture_camera_picture(int picture, gpu3d_geometry_frame &out,
+        const gpu3d_rams *color_snapshot=nullptr) const;
 	// the picture shown now (its list and its map), not marked drawn (-1: none)
 	int shown_index() const { return m_render_test_mode ? -1 : shown_now(); }
 	// The host's Auto (CPU or GPU): a made-up scene the size of a fight's (bench_make), drawn on
@@ -130,8 +151,15 @@ public:
 	// each one's changes: the board counts them (note_ram, before and as it changes one)
 	void gpu_rams(gpu3d_rams &out) const;
 	enum { GPU_TEX0, GPU_TEX1, GPU_LUMA, GPU_XLAT };
-	void note_ram(int which) { m_ram_gen[which]++; }
+	void note_ram(int which,u32 offset=~0u) {
+		m_ram_gen[which]++;
+		if(which==GPU_TEX0||which==GPU_TEX1){
+			if(offset==~0u)for(auto &generation:m_texture_page_gen[which])++generation;
+			else ++m_texture_page_gen[which][(offset&0x7ffff)/1024];
+		}
+	}
 	u32 m_ram_gen[4] = {};
+	u32 m_texture_page_gen[2][512] = {}; // upload metadata, not emulated state
 	void render_size(int &w, int &h) const { w = (496 + 2 * m_ext) * m_scale; h = 384 * m_scale; }
 	int render_scale() const { return m_scale; }
 	int polygons_drawn(int ago) const;
@@ -173,6 +201,10 @@ public:
 	// again). False: none kept under the key.
 	void keep_geo(uint64_t key);
 	bool restore_geo(uint64_t key);
+	// Persistent development checkpoints: the numeric geometry state, without
+	// pointers or rendered pictures. A few frames rebuild the picture pipeline.
+	void save_geometry(std::vector<uint8_t> &out);
+	bool load_geometry(const uint8_t *data, size_t size);
 	// The 3D drawn at `scale` times the arcade's 496 x 384 (1: MAME's picture). Only where the
 	// polygons fall on the screen is scaled: each pixel's colour comes from the same texels, at
 	// its own u, v and z, by the same code. The last polygons drawn are drawn again at once.
@@ -296,6 +328,13 @@ private:
 	friend class texdump;          // VF2_DUMP_TEXTURES (texdump.h)
 	std::unique_ptr<raster_state> m_raster;
 	std::unique_ptr<geo_state> m_geo;
+    struct geometry_job_state;
+    std::unique_ptr<geometry_job_state> m_geometry_job;
+    uint32_t m_geometry_dirty_pages=~uint32_t(0);
+    geometry_execution m_geometry_execution=geometry_execution::synchronous;
+    void execute_geometry_job();
+    void geo_parse_list(u32 *buffer,u32 start,u64 frame);
+    bool geometry_job_compatible()const;
 	std::unique_ptr<model2_renderer> m_renderer;
 	bool m_render_done = false;
 	bool m_render_test_mode = false;
@@ -309,6 +348,21 @@ private:
 	int m_shown[3] = { -1, -1, -1 };
 	int m_delay = 0;
 	bool m_defer = false, m_deferred = false;   // deferring; a picture's polygons not drawn yet
+	struct raw_polygon;
+	using compact_raw_polygon=gpu3d_compact_camera_poly;
+	std::vector<raw_polygon> m_camera_pending;
+	std::unique_ptr<gpu3d_shared_camera_list> m_shared_camera_pending;
+    uint32_t m_camera_context_index=UINT32_MAX;
+    uint16_t m_camera_context_center=0;
+    std::vector<compact_raw_polygon> m_compact_camera_pending;
+    struct mesh_capture;
+    std::unique_ptr<mesh_capture> m_mesh_capture;
+	bool m_compact_camera=false;
+    bool m_shared_camera=false;
+    std::shared_ptr<gpu3d_shared_camera_list> m_shared_camera_spare;
+	static void expand_camera(const compact_raw_polygon &raw,gpu3d_camera_poly &out);
+	bool m_camera_packets = false;
+	int m_camera_live = -1;
 	int shown_now() const { return m_shown[2 - m_delay]; }
 	int m_scale = 1, m_ext = 0;
 	int16_t m_crtc_xoffset = 0, m_crtc_yoffset = 0;
@@ -355,6 +409,7 @@ private:
 	u64 m_smooth_floor = 0;                            // no blending from a frame before this one
 	u64 m_parsed_frame = 0, m_pic_frame[4] = {};       // the last list's frame; each picture's list's
 	struct geo_keep;
+	template<class IO> void geometry_state(IO &io);
 	std::vector<std::unique_ptr<geo_keep>> m_geo_keeps;   // keep_geo's, the last few saves'
 	size_t m_geo_keep_next = 0;
 	void smooth_record_start();
@@ -381,7 +436,7 @@ private:
 	const double *freecam_cam(smooth_rec &r);          // the game's camera at r's frame, from the anchor's (filled in as needed)
 	void freecam_pose_from(const double *K);           // the free camera put at the game's camera K
 	void freecam_pose(double *P) const;                // its pose: its axes and place in the anchor's view
-	void smooth_note_object(u32 oba, const float *matrix);
+	void smooth_note_object(u32 oba,u32 count,u32 mode,u32 tpa,u32 tha,const float *matrix,float focus_x,float focus_y);
 	void smooth_note_focal(float x, float y);
 	void smooth_note_light(float x, float y, float z);
 	void render_polygons();
@@ -417,6 +472,8 @@ private:
 	u32 *geo_code_jump( geo_state *geo, u32 opcode, u32 *input );
 	// geo code drawing paths
 	void geo_parse_np_ns( geo_state *geo, u32 *input, u32 count );
+	template<bool Direct> void geo_parse_np_s_impl(geo_state *geo,u32 *input,u32 count);
+	u64 m_direct_geometry_polygons=0;
 	void geo_parse_np_s( geo_state *geo, u32 *input, u32 count );
 	void geo_parse_nn_ns( geo_state *geo, u32 *input, u32 count );
 	void geo_parse_nn_s( geo_state *geo, u32 *input, u32 count );
@@ -424,6 +481,7 @@ private:
 	// raster functions
 	// main data input port
 	void model2_3d_push(raster_state *raster, u32 input);
+	template<unsigned N> void model2_3d_push_words(raster_state *raster,const u32 (&input)[N]);
 	u32 *m_geo_end = nullptr;   // (the end of the memory the geometrizer reads words from now: GEO_NEXT)
 	// polygon push path
 	template <unsigned NumVerts>
@@ -518,10 +576,20 @@ struct model2_video::drawn_poly
 };
 
 // A 3D picture: the polygons drawn (picture 0 in the renderer's destmap) and the list drawn
+struct gpu3d_mesh_object;
+struct gpu3d_mesh_polygon;
+
 struct model2_video::picture3d
 {
 	bitmap_rgb32 map;
 	std::vector<drawn_poly> drawn;
+	std::vector<raw_polygon> camera;
+	std::vector<compact_raw_polygon> compact_camera;
+    std::shared_ptr<gpu3d_shared_camera_list> shared_compact_camera;
+    std::vector<gpu3d_mesh_object> mesh_objects;
+    std::vector<gpu3d_mesh_polygon> mesh_polygons;
+	int16_t camera_xoffset=0,camera_yoffset=0;
+	uint8_t camera_window=0;
 	bool deferred = false;   // the list not drawn in the map yet
 };
 
@@ -684,7 +752,7 @@ struct model2_video::smooth_rec
 	plane clip_plane[4][4];
 	std::vector<u16> texture_ram;
 	std::vector<u8> log_ram;
-	struct object { u32 oba; float m[12]; };
+	struct object { u32 oba,count,mode,tpa,tha; float m[12],focus[2]; };
 	std::vector<object> objects;
 	std::vector<std::array<float, 3>> lights;
 	std::vector<std::array<float, 2>> focals;

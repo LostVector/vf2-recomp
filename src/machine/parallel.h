@@ -4,6 +4,7 @@
 #include <pthread.h>
 #endif
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstdlib>
 #include <functional>
@@ -49,17 +50,18 @@ public:
 		// one caller at a time (another thread drawing at once would share the counters)
 		std::lock_guard<std::mutex> one(m_run_mu);
 		struct in_pool { in_pool() { t_in_pool = true; } ~in_pool() { t_in_pool = false; } } mark;
+		const int parts = tasks ? n : std::min(n, t * std::max(1, per_thread));
 		{
 			std::lock_guard<std::mutex> l(m_mu);
 			m_job = &f;
 			m_n = n;
-			m_parts = tasks ? n : std::min(n, t * std::max(1, per_thread));
-			m_next = 0;
+			m_parts = parts;
+			m_next.store(0, std::memory_order_relaxed);
 			m_left = t - 1;             // the workers still to finish
 			m_gen++;
 		}
 		m_cv.notify_all();
-		take_bands(f, n);
+		take_bands(f, n, parts);
 		std::unique_lock<std::mutex> l(m_mu);
 		m_done.wait(l, [&] { return m_left == 0; });
 		m_job = nullptr;
@@ -71,26 +73,36 @@ private:
 	static inline thread_local bool t_in_pool = false;
 	std::condition_variable m_cv, m_done;
 	const std::function<void(int, int)> *m_job = nullptr;
-	int m_n = 0, m_parts = 0, m_next = 0, m_left = 0;
+	int m_n = 0, m_parts = 0, m_left = 0;
+	std::atomic<unsigned> m_next{0};
 	unsigned m_gen = 0;
 	bool m_quit = false;
 
 	static std::pair<int, int> band(int i, int n, int parts) { return { n * i / parts, n * (i + 1) / parts }; }
 
-	// draws bands until none are left
-	void take_bands(const std::function<void(int, int)> &f, int n)
+	// A generation's band layout and callable stay fixed until the caller
+	// and every worker finish. Only the assignment counter is shared
+	// while bands are executing.
+	void take_bands(const std::function<void(int, int)> &f, int n, int parts)
 	{
+		static const bool atomic_claims = std::getenv("VF2_ATOMIC_ROW_CLAIMS") != nullptr;
+		static const bool direct_tasks = std::getenv("VF2_DIRECT_TASK_RANGES") != nullptr;
+		const auto claim = [&] {
+			if (atomic_claims) return m_next.fetch_add(1, std::memory_order_relaxed);
+			std::lock_guard<std::mutex> l(m_mu);
+			const unsigned i = m_next.load(std::memory_order_relaxed);
+			if (i < unsigned(parts)) m_next.store(i + 1, std::memory_order_relaxed);
+			return i;
+		};
 		for (;;) {
-			int i, parts;
-			{
-				std::lock_guard<std::mutex> l(m_mu);
-				if (m_next >= m_parts) return;
-				i = m_next++;
-				parts = m_parts;
-			}
+			const unsigned i = claim();
+			if (i >= unsigned(parts)) return;
 			if (band_hook) band_hook();
-			auto [b, e] = band(i, n, parts);
-			f(b, e);
+			if (direct_tasks && n == parts) f(int(i), int(i) + 1);
+			else {
+				auto [b, e] = band(int(i), n, parts);
+				f(b, e);
+			}
 		}
 	}
 
@@ -112,10 +124,10 @@ private:
 					if (m_quit) return;
 					seen = m_gen;
 					const auto *job = m_job;
-					const int n = m_n;
+					const int n = m_n, parts = m_parts;
 					l.unlock();
 					t_in_pool = true;
-					take_bands(*job, n);
+					take_bands(*job, n, parts);
 					t_in_pool = false;
 					l.lock();
 					if (--m_left == 0) m_done.notify_one();

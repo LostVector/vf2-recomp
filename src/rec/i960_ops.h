@@ -29,6 +29,7 @@ struct i960_rec
 	using C = i960_device;
 
 	static u32 *regs(C &c) { return c.m_r; }
+    static double *fpregs(C &c) { return c.m_fp; }
 	static u32 &ip(C &c) { return c.m_IP; }
 	static u32 &pip(C &c) { return c.m_PIP; }
 	static int &icount(C &c) { return c.m_icount; }
@@ -153,20 +154,20 @@ struct i960_rec
 	// ---- memory (the core's unaligned helpers), plain memory straight from where it is ----
 	static I960_FI u8 *rp(C &c, u32 a) { return a < (i960rec::runtime::PAGES << 12) ? c.m_rec->rpage.data()[a >> 12] : nullptr; }
 	static I960_FI u8 *wp(C &c, u32 a) { return a < (i960rec::runtime::PAGES << 12) ? c.m_rec->wpage.data()[a >> 12] : nullptr; }
-	static I960_FI u8 rd8(C &c, u32 a)
+	template<bool UsePage=true> static I960_FI u8 rd8(C &c, u32 a)
 	{
-		if (u8 *p = rp(c, a)) return p[a & 0xfff];
+		if constexpr(UsePage) if (u8 *p = rp(c, a)) return p[a & 0xfff];
 		return c.m_program.read_byte(a);
 	}
-	static I960_FI void wr8(C &c, u32 a, u8 v)
+	template<bool UsePage=true> static I960_FI void wr8(C &c, u32 a, u8 v)
 	{
-		if (u8 *p = wp(c, a)) { p[a & 0xfff] = v; return; }
+		if constexpr(UsePage) if (u8 *p = wp(c, a)) { p[a & 0xfff] = v; return; }
 		c.m_program.write_byte(a, v);
 	}
-	static I960_FI u32 rd32(C &c, u32 a)
+	template<bool UsePage=true> static I960_FI u32 rd32(C &c, u32 a)
 	{
 		if (a & 3) return c.m_program.read_byte(a) | c.m_program.read_byte(a + 1) << 8 | c.m_program.read_byte(a + 2) << 16 | u32(c.m_program.read_byte(a + 3)) << 24;
-		if (u8 *p = rp(c, a)) { u32 v; memcpy(&v, p + (a & 0xfff), 4); return v; }
+		if constexpr(UsePage) if (u8 *p = rp(c, a)) { u32 v; memcpy(&v, p + (a & 0xfff), 4); return v; }
 		return c.m_program.read_dword(a);
 	}
 	static I960_FI std::pair<u32, u16> rd32f(C &c, u32 a)
@@ -178,21 +179,23 @@ struct i960_rec
 		if (u8 *p = rp(c, a)) { u32 v; memcpy(&v, p + (a & 0xfff), 4); return { v, i960_cpu_device::BURST }; }
 		return c.m_program.read_dword_flags(a);
 	}
-	static I960_FI u16 rd16(C &c, u32 a)
+	template<bool UsePage=true> static I960_FI u16 rd16(C &c, u32 a)
 	{
 		if (a & 1) return u16(c.m_program.read_byte(a) | c.m_program.read_byte(a + 1) << 8);
-		if (u8 *p = rp(c, a)) { u16 v; memcpy(&v, p + (a & 0xfff), 2); return v; }
+		if constexpr(UsePage) if (u8 *p = rp(c, a)) { u16 v; memcpy(&v, p + (a & 0xfff), 2); return v; }
 		return c.m_program.read_word(a);
 	}
-	static I960_FI void wr32(C &c, u32 a, u32 v)
+	template<bool UsePage=true> static I960_FI void wr32(C &c, u32 a, u32 v)
 	{
 		if (a & 3) {
 			c.m_program.write_byte(a, v & 0xff);
 			c.m_program.write_byte(a + 1, (v >> 8) & 0xff);
 			c.m_program.write_byte(a + 2, (v >> 16) & 0xff);
 			c.m_program.write_byte(a + 3, (v >> 24) & 0xff);
-		} else if (u8 *p = wp(c, a)) memcpy(p + (a & 0xfff), &v, 4);
-		else c.m_program.write_dword(a, v);
+			return;
+		}
+		if constexpr(UsePage) if (u8 *p = wp(c, a)) { memcpy(p + (a & 0xfff), &v, 4); return; }
+		c.m_program.write_dword(a, v);
 	}
 	static I960_FI u16 wr32f(C &c, u32 a, u32 v)
 	{
@@ -206,32 +209,21 @@ struct i960_rec
 		if (u8 *p = wp(c, a)) { memcpy(p + (a & 0xfff), &v, 4); return i960_cpu_device::BURST; }
 		return c.m_program.write_dword_flags(a, v);
 	}
-	static I960_FI void wr16(C &c, u32 a, u16 v)
+	template<bool UsePage=true> static I960_FI void wr16(C &c, u32 a, u16 v)
 	{
-		if (a & 1) { c.m_program.write_byte(a, v & 0xff); c.m_program.write_byte(a + 1, (v >> 8) & 0xff); }
-		else if (u8 *p = wp(c, a)) memcpy(p + (a & 0xfff), &v, 2);
-		else c.m_program.write_word(a, v);
+		if (a & 1) { c.m_program.write_byte(a, v & 0xff); c.m_program.write_byte(a + 1, (v >> 8) & 0xff); return; }
+		if constexpr(UsePage) if (u8 *p = wp(c, a)) { memcpy(p + (a & 0xfff), &v, 2); return; }
+		c.m_program.write_word(a, v);
 	}
 
 	// ldl/ldt/ldq: n words to r[t2..]; false if the access stalled (the burst saved, as MAME)
 	static I960_FI bool ld_multi(C &c, u32 t1, u32 t2, int n)
 	{
-		for (int i = 0; i < n; i++) {
-			auto pack = rd32f(c, t1);
-			if (c.m_stalled) { c.burst_stall_save(t1, t2, i, n, false); return false; }
-			c.m_r[t2 + i] = pack.first;
-			if (pack.second & i960_cpu_device::BURST) t1 += 4;
-		}
-		return true;
+		return c.read_multiple(t1,t2,n,[&](u32 a){return rd32f(c,a);});
 	}
 	static I960_FI bool st_multi(C &c, u32 t1, u32 t2, int n)
 	{
-		for (int i = 0; i < n; i++) {
-			const u16 flags = wr32f(c, t1, c.m_r[t2 + i]);
-			if (c.m_stalled) { c.burst_stall_save(t1, t2, i, n, true); return false; }
-			if (flags & i960_cpu_device::BURST) t1 += 4;
-		}
-		return true;
+		return c.write_multiple(t1,t2,n,[&](u32 a,u32 value){return wr32f(c,a,value);});
 	}
 
 	static void do_call(C &c, u32 adr, int type, u32 stack) { c.do_call(adr, type, stack); }

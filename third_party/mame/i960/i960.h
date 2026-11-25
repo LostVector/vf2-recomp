@@ -143,7 +143,61 @@ protected:   // (vf2-recomp: protected, not private, for the recompiler in src/r
 	std::pair<uint32_t, uint16_t> i960_read_dword_unaligned_flags(uint32_t address);
 	uint16_t i960_read_word_unaligned(uint32_t address);
 	void i960_write_dword_unaligned(uint32_t address, uint32_t data);
+	template<class FlaggedLoad>
+	bool read_multiple(uint32_t address, uint32_t base_register, int count, FlaggedLoad load)
+	{
+		for (int i=0;i<count;++i) {
+			const auto [value,flags]=load(address);
+			if (m_stalled) {
+				burst_stall_save(address,base_register,i,count,false);
+				return false;
+			}
+			m_r[base_register+i]=value;
+			if (flags & BURST) {
+				address+=4;
+			} else if (flags & VF2_FIXED_LOAD_PORT) {
+				// The board marked an aligned port whose address and flags
+				// stay fixed for the rest of this instruction.
+				for (++i;i<count;++i) {
+					const auto word=m_program.read_dword(address);
+					if (m_stalled) {
+						burst_stall_save(address,base_register,i,count,false);
+						return false;
+					}
+					m_r[base_register+i]=word;
+				}
+				break;
+			}
+		}
+		return true;
+	}
 	uint16_t i960_write_dword_unaligned_flags(uint32_t address, uint32_t data);
+	template<class FlaggedStore>
+	bool write_multiple(uint32_t address, uint32_t base_register, int count, FlaggedStore store)
+	{
+		for (int i=0;i<count;++i) {
+			const auto flags=store(address,m_r[base_register+i]);
+			if (m_stalled) {
+				burst_stall_save(address,base_register,i,count,true);
+				return false;
+			}
+			if (flags & BURST) {
+				address+=4;
+			} else if (flags & VF2_FIXED_STORE_PORT) {
+				// The board marked an aligned port whose address and flags
+				// stay fixed for the rest of this instruction.
+				for (++i;i<count;++i) {
+					m_program.write_dword(address,m_r[base_register+i]);
+					if (m_stalled) {
+						burst_stall_save(address,base_register,i,count,true);
+						return false;
+					}
+				}
+				break;
+			}
+		}
+		return true;
+	}
 	void i960_write_word_unaligned(uint32_t address, uint16_t data);
 	void send_iac(uint32_t adr);
 	uint32_t get_ea(uint32_t opcode);

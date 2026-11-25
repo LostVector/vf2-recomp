@@ -1,0 +1,2 @@
+tools/acm/*.sh text eol=lf
+tools/acm/Dockerfile text eol=lf

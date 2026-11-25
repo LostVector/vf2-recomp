@@ -8,42 +8,67 @@
 // Giles), with machine/gen_fifo.cpp (Olivier Galibert) for the two FIFOs between i960 and TGP.
 // The sound board's 68000 is MAME's (cpu/m68000, Olivier Galibert), on the board's bus.
 #include "model2a.h"
+#include "../core/scheduler_gap.h"
+#include "../core/frame_clock.h"
 #include "parallel.h"
 #include <zlib.h>
 #include <chrono>
+#include <cstdlib>
+#include <bit>
 #include <random>
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 // ---------------------------------------------------------------------------------------------
 // The TGP (MB86234): MAME's copro_tgp_* maps. Its FIFOs are the board's (fifo_pop/fifo_push).
 // ---------------------------------------------------------------------------------------------
+
+static const bool g_tgp_stable_program = getenv("VF2_TGP_STABLE_PROGRAM") != nullptr;
+static const bool g_track_geometry_pages = getenv("VF2_TRACK_GEOMETRY_PAGES") != nullptr;
 
 struct model2a::tgp_bus : mb86233_bus
 {
 	model2a &m;
 	mb86233_device cpu{*this};
 	u32 prog[0x1000]{};
-	u32 ram0[0x100]{}, ram1[0x200]{};
+	uint64_t program_revision_id=1;
+    // The hardware's unmapped 0100-01ff range stays zero.
+    u32 ram[0x400]{};
 	u32 bank_reg = 0;
 	u32 sincos_base = 0, inv_base = 0, isqrt_base = 0, atan_base[4]{};
 	const u32 *tables;   // copro_tgp_tables as 32-bit words
 
 	explicit tgp_bus(model2a &mm) : m(mm), tables(reinterpret_cast<const u32 *>(mm.m_roms.regions[romset::COPRO_TABLES].data())) {}
 
+	int run(int cycles)
+	{
+		if(g_tgp_stable_program)return cpu.run_mapped(cycles,prog,program_revision_id);
+		return cpu.run(cycles);
+	}
+
 	u32 prog_r(u32 a) override { return prog[a & 0xfff]; }
+	const u32 *program_data()const override{return prog;}
+	uint64_t program_revision()const override{return program_revision_id;}
+	internal_ram direct_internal_ram()override{
+        static const bool read_window=std::getenv("VF2_TGP_READ_WINDOW")!=nullptr;
+        return {ram,ram+0x200,read_window?ram:nullptr};
+    }
+    bool isolated_internal_ram()const override{return true;}
+    bool native_control_callbacks()const override{return true;}
 
 	u32 data_r(u32 a) override
 	{
 		a &= 0xffff;
-		if (a < 0x100) return ram0[a];
-		if (a >= 0x200 && a < 0x400) return ram1[a - 0x200];
+		if (a < 0x100 || (a >= 0x200 && a < 0x400)) return ram[a];
 		return 0;
 	}
 
 	void data_w(u32 a, u32 v) override
 	{
 		a &= 0xffff;
-		if (a < 0x100) ram0[a] = v;
-		else if (a >= 0x200 && a < 0x400) ram1[a - 0x200] = v;
+		if (a < 0x100 || (a >= 0x200 && a < 0x400)) ram[a] = v;
 	}
 
 	// copro_tgp_io_map: the table units, and over them all the bank view when it's enabled
@@ -60,7 +85,11 @@ struct model2a::tgp_bus : mb86233_bus
 	void memory_w(u32 offset, u32 data)
 	{
 		u32 adr = (bank_reg & 0xff0000) | offset;
-		if (adr & 0x400000) memcpy(&m.m_bufferram[(adr & 0x7fff) * 4], &data, 4);
+		if (adr & 0x400000) {
+            const u32 offset=(adr&0x7fff)*4;
+            if(g_track_geometry_pages)m.m_video->mark_geometry_page(offset);
+            memcpy(&m.m_bufferram[offset],&data,4);
+        }
 	}
 
 	u32 io_r(u32 a) override
@@ -163,6 +192,31 @@ mb86233_device &model2a::tgp() { return m_tgp->cpu; }
 
 // ---------------------------------------------------------------------------------------------
 
+void model2a::release_unused_roms()
+{
+	for (int id : {romset::COPRO_DATA, romset::OTHER_DATA, romset::VIDEO_UNK})
+		std::vector<u8>().swap(m_roms.regions[id]);
+#if defined(__linux__)
+	// VF2's 36 MiB data and 32 MiB polygon regions contain large zero-padded
+	// ranges. Keep their address/mirror semantics, but let Linux back untouched
+	// zero pages with its shared zero page rather than private physical RAM.
+	// Exclude allocator headers and any neighbouring allocation at both ends.
+	const size_t page=size_t(sysconf(_SC_PAGESIZE));
+	if (!page || (page & (page-1))) return;
+	std::vector<u8> zero(page,0);
+	for (auto &region : m_roms.regions) {
+		if(region.empty())continue;
+		uintptr_t begin=(reinterpret_cast<uintptr_t>(region.data())+page-1)&~uintptr_t(page-1);
+		uintptr_t end=(reinterpret_cast<uintptr_t>(region.data())+region.size())&~uintptr_t(page-1),run=0;
+		for(uintptr_t at=begin;at<end;at+=page){
+			if(!std::memcmp(reinterpret_cast<const void*>(at),zero.data(),page)){if(!run)run=at;}
+			else if(run){madvise(reinterpret_cast<void*>(run),at-run,MADV_DONTNEED);run=0;}
+		}
+		if(run)madvise(reinterpret_cast<void*>(run),end-run,MADV_DONTNEED);
+	}
+#endif
+}
+
 model2a::model2a(romset::result &&roms, bool recompile)
 	: m_roms(std::move(roms)), m_rom(m_roms.regions[romset::MAINCPU]), m_data(m_roms.regions[romset::MAIN_DATA]),
 	  m_cpu(*this)
@@ -210,12 +264,14 @@ void model2a::cpu_sched::set_rate(uint64_t cycles_per_second)
 {
 	period = AS_PER_SEC / cycles_per_second;
 	uint64_t attos = uint64_t(period);
+	elapsed.set(attos);
 	divshift = 0;
 	while (attos >= (1ull << 31)) { divshift++; attos >>= 1; }
 	divisor = u32(attos);
+	divide_cycles.set(divisor);
 }
 
-model2a::~model2a() { render_wait(); }
+model2a::~model2a() { render_wait(); m_video->geometry_wait(); }
 
 // ---------------------------------------------------------------------------------------------
 // The settings block in backup RAM (found by changing them in test mode): a CRC-16 (CCITT,
@@ -227,6 +283,7 @@ model2a::~model2a() { render_wait(); }
 
 namespace {
 constexpr u32 SETTINGS = 0x3300, SETTINGS_COIN = SETTINGS + 0x24, FREE_PLAY = 0x19;
+uint64_t now_ns() { using namespace std::chrono; return uint64_t(duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count()); }
 constexpr u32 NEXT_STAGE_PRINT = 0xfb0dda39;   // "TRY NEXT STAGE"'s backdrop_print (see wall_sides)
 
 // (the counter before the CRC'd bytes grows into 0x1a and on as the board runs: in a backup that
@@ -603,7 +660,7 @@ constexpr double FC_SKY_SX = 1, FC_SKY_SY = -1;   // (the free camera's: the bac
 
 // a / b for the scheduler's times: the same quotient, in 64 bits when they fit (a 128-bit
 // division is a library call)
-static inline uint64_t div_atime(unsigned __int128 a, unsigned __int128 b)
+static inline uint64_t div_atime(vf2::uint128_t a, vf2::uint128_t b)
 {
 	return (a >> 64) == 0 && (b >> 64) == 0 ? uint64_t(a) / uint64_t(b) : uint64_t(a / b);
 }
@@ -622,6 +679,7 @@ uint64_t model2a::tgp_now() const
 
 void model2a::reset()
 {
+	m_cooperative_ready=m_cooperative_pumping=m_cooperative_wait_input=false;
 	render_wait();
 	m_snd_queue.clear();
 	m_snd_next = 0;
@@ -635,6 +693,7 @@ void model2a::reset()
 	for (auto &sm : m_scroll_hist) sm = scroll_sample{};
 	// model2_state::machine_reset and the devices' resets, at time 0
 	for (auto &t : m_timer) t = timer{};
+	rebuild_timer_queue();
 	m_timer_seq = 0;
 	m_head = -1;
 	for (auto &q : m_line_queue) q.clear();
@@ -642,6 +701,9 @@ void model2a::reset()
 	for (int i = 0; i < N_CPUS; i++) m_order[i] = i;
 	m_suspend_changes = false;
 	if (!m_sound_on) suspend(CPU_68K, SUSPEND_HALT);   // the debugger's `suspend :audiocpu`, before it runs at all
+	// Cost probe only: run the board's timers, UART link and scheduler while
+	// holding the 68000, to separate its execution cost from the rest.
+	if (m_sound_on && std::getenv("VF2_68K_HALT")) suspend(CPU_68K, SUSPEND_HALT);
 	m_tgp_cycle_base = 0;
 	m_base = 0;
 	m_executing = -1;
@@ -652,6 +714,7 @@ void model2a::reset()
 	m_ctrlmode = false;
 	for (int i = 0; i < 4; i++) { m_timervals[i] = m_timerorig[i] = 0xfffff; m_timerrun[i] = false; }
 	for (size_t i = 0; i < m_bufferram.size(); i += 4) { u32 v = 0x07800f0f; memcpy(&m_bufferram[i], &v, 4); }
+	m_video->invalidate_geometry_pages();
 	m_geo_write_start = 0;
 	m_video->m_geo_read_start_address = 0;
 	m_videocontrol = 0;
@@ -710,8 +773,8 @@ void model2a::power_on()
 	m_cpu.power_on();
 	m_tgp->cpu.power_on();
 	std::fill(std::begin(m_tgp->prog), std::end(m_tgp->prog), 0);
-	std::fill(std::begin(m_tgp->ram0), std::end(m_tgp->ram0), 0);
-	std::fill(std::begin(m_tgp->ram1), std::end(m_tgp->ram1), 0);
+	++m_tgp->program_revision_id;
+	std::fill(std::begin(m_tgp->ram), std::end(m_tgp->ram), 0);
 	m_tgp->bank_reg = m_tgp->sincos_base = m_tgp->inv_base = m_tgp->isqrt_base = 0;
 	std::fill(std::begin(m_tgp->atan_base), std::end(m_tgp->atan_base), 0);
 	m_video->power_on();
@@ -738,12 +801,12 @@ static_assert(sizeof(state_header) == model2a::STATE_HEADER);
 const char *const PAGED_NAMES[] = { "tile ram", "char ram", "palette", "colour tables", "framebuffer a", "framebuffer b",
 	"texture ram 0", "texture ram 1", "luma ram" };
 
-template <class IO> void attos(IO &io, unsigned __int128 &t)   // (the scheduler's times, as two 64-bit halves)
+template <class IO> void attos(IO &io, vf2::uint128_t &t)   // (the scheduler's times, as two 64-bit halves)
 {
 	uint64_t lo = uint64_t(t), hi = uint64_t(t >> 64);
 	io.pod(lo);
 	io.pod(hi);
-	t = (unsigned __int128)hi << 64 | lo;
+	t = vf2::uint128_t(hi) << 64 | lo;
 }
 
 template <class IO, class E> void enum32(IO &io, E &e, int32_t last)   // (one of 0 to last: else the state's refused)
@@ -808,7 +871,9 @@ template <class IO> void model2a::state(IO &io)
 	m_cpu.state(io);
 	io.section("tgp");
 	m_tgp->cpu.state(io);
-	io.pod(m_tgp->prog); io.pod(m_tgp->ram0); io.pod(m_tgp->ram1);
+	io.pod(m_tgp->prog);
+    io.bytes(m_tgp->ram,0x100*sizeof(u32));
+    io.bytes(m_tgp->ram+0x200,0x200*sizeof(u32));
 	io.pod(m_tgp->bank_reg); io.pod(m_tgp->sincos_base); io.pod(m_tgp->inv_base); io.pod(m_tgp->isqrt_base); io.pod(m_tgp->atan_base);
 	io.section("scheduler");
 	for (timer &t : m_timer) {
@@ -826,7 +891,7 @@ template <class IO> void model2a::state(IO &io)
 	io.pod(m_frame_number); io.pod(m_tgp_cycle_base);
 	io.section("fifos");
 	for (gen_fifo *f : { &m_fifo_in, &m_fifo_out }) {
-		io.deq(f->values); io.deq(f->extra);
+		f->values.state(io); io.deq(f->extra);
 		io.pod(f->empty_triggered); io.pod(f->full_triggered);
 	}
 	io.section("board");
@@ -905,6 +970,7 @@ bool model2a::state_sane() const
 
 void model2a::save_state(std::vector<uint8_t> &out, std::vector<m2::StateSection> *sections)
 {
+	advance_aux_clocks(m_base);
 	render_wait();   // (a picture being drawn alongside may have taken the 3D's RAMs back for a moment)
 	if (sections) sections->clear();
 	const size_t fixed = fixed_state_size();
@@ -962,6 +1028,7 @@ bool model2a::load_state(const uint8_t *p, size_t n)
 	whole(m_ram200.data(), m_ram200.size());
 	whole(m_workram.data(), m_workram.size());
 	whole(m_bufferram.data(), m_bufferram.size());
+	m_video->invalidate_geometry_pages();
 	whole(m_cpuctl.data(), m_cpuctl.size());
 	whole(m_m2comm_share.data(), m_m2comm_share.size());
 	whole(m_backup.data(), m_backup.size());
@@ -991,7 +1058,19 @@ bool model2a::load_state(const uint8_t *p, size_t n)
 	}
 	m2::StateReader rd(p + fixed, n - fixed);
 	state(rd);
+	// The board's held/running state is part of the scheduler snapshot, and every
+	// checkpoint was saved with the board held (set_sound(false)), so it carries
+	// SUSPEND_HALT for the 68000. Loading one with sound on must start the 68000:
+	// otherwise the sound board stays silent and it costs nothing to "run".
+	if (m_sound_on) {
+		auto &s68 = m_sched[CPU_68K];
+		s68.suspend &= ~SUSPEND_HALT;
+		s68.nextsuspend &= ~SUSPEND_HALT;
+	}
+	m_cooperative_ready=false;
+	++m_tgp->program_revision_id;
 	m_head = -1;
+	rebuild_timer_queue();
 	// the geometrizer and rasterizer as they were at the save (kept by this board), not as the frames since left them
 	if (since) m_video->restore_geo(uint64_t(h.epoch) << 32 | h.gen);
 	// smooth motion's record of the 3D's RAMs changing: the frames from the one restored on are to run again
@@ -1007,6 +1086,10 @@ bool model2a::load_state(const uint8_t *p, size_t n)
 	m_next_pitch = int16_t(m_workram[0x3010] | m_workram[0x3011] << 8);
 	for (auto &in : m_scroll_in) if (in.frame >= int64_t(m_frame_number)) in = scroll_input{};
 	for (auto &sm : m_scroll_hist) if (sm.frame >= int64_t(m_frame_number)) sm = scroll_sample{};
+	// The board's clock comes back with the state but its sample history does not:
+	// start the stream at the restored time, or the first update would make every
+	// sample since power-on in one block (1.8M samples on the fight checkpoint).
+	if (m_scsp) m_scsp->start_stream_now();
 	return rd.done();
 }
 
@@ -1018,38 +1101,101 @@ bool model2a::load_state(const uint8_t *p, size_t n)
 // ---------------------------------------------------------------------------------------------
 
 static const bool g_sched_log = getenv("VF2_SCHED_LOG") != nullptr;
+static const bool g_skip_inert_handoffs=std::getenv("VF2_SKIP_INERT_HANDOFFS")!=nullptr;
+#if defined(VF2_SCHED_DIAGNOSTICS)
+#define SCHED_COUNT(...) do { __VA_ARGS__; } while(false)
+#else
+#define SCHED_COUNT(...) do {} while(false)
+#endif
+static const bool g_reference_division = getenv("VF2_REFERENCE_DIVISION") != nullptr;
+static const bool g_frame_budget_division=getenv("VF2_FRAME_BUDGET_DIVISION")!=nullptr;
+static const bool g_i960_timer_reciprocal = getenv("VF2_I960_TIMER_RECIPROCAL") != nullptr;
+static const bool g_sync_timer_fast = getenv("VF2_SYNC_TIMER_FAST") != nullptr;
+static const bool g_fast_halt_delivery = getenv("VF2_FAST_HALT_DELIVERY") != nullptr;
+static const bool g_fuse_fifo_halt = getenv("VF2_FUSE_FIFO_HALT") != nullptr;
+static const bool g_fixed_fifo_store = getenv("VF2_I960_FIXED_FIFO_STORE") != nullptr;
+static const bool g_fixed_fifo_load = getenv("VF2_I960_FIXED_FIFO_LOAD") != nullptr;
+static const u16 g_fifo_port_flags=(g_fixed_fifo_store?VF2_FIXED_STORE_PORT:0)|
+                                  (g_fixed_fifo_load?VF2_FIXED_LOAD_PORT:0);
+static const bool g_reference_timers = getenv("VF2_REFERENCE_TIMERS") != nullptr;
+static const bool g_modular_clock = getenv("VF2_MODULAR_CLOCK") != nullptr;
+static const bool g_cache_2d_pens = getenv("VF2_CACHE_2D_PENS") != nullptr;
+static const bool g_scheduler_gaps = getenv("VF2_SCHEDULER_GAPS") != nullptr;
+static const bool g_reference_duration = getenv("VF2_REFERENCE_DURATION") != nullptr;
+static const bool g_lazy_aux_clocks = getenv("VF2_LAZY_AUX_CLOCKS") != nullptr;
+static const bool g_cooperative_fifo = getenv("VF2_COOPERATIVE_FIFO") != nullptr;
+static const bool g_cooperative_timed = getenv("VF2_COOPERATIVE_TIMED") != nullptr;
+static const unsigned g_cooperative_batch = unsigned(std::clamp(getenv("VF2_COOPERATIVE_BATCH")?atoi(getenv("VF2_COOPERATIVE_BATCH")):1,1,8));
 static bool sched_log_on(double ns)
 {
 	static const double lo = getenv("VF2_SCHED_LOG") ? atof(getenv("VF2_SCHED_LOG")) : -1;
 	static const double hi = getenv("VF2_SCHED_LOG_END") ? atof(getenv("VF2_SCHED_LOG_END")) : 1e300;
 	return lo >= 0 && ns >= lo && ns <= hi;
 }
-#define SLOG(t, ...) do { if (!g_sched_log) break; const double ns_ = double(t) / 1e9; if (sched_log_on(ns_)) fprintf(stderr, "[%.3f ns] %s\n", ns_, string_format(__VA_ARGS__).c_str()); } while (0)
+// Keep optional formatting and debugger-hook construction out of the hot
+// scheduler's stack frame and register allocation, even when tracing is off.
+__attribute__((noinline,cold)) static void sched_log_adjust(const vf2::uint128_t &start,int id,const vf2::uint128_t &expire,int cpu){
+    const double ns=double(start)/1e9;
+    if(sched_log_on(ns))std::fprintf(stderr,"[%.3f ns] adjust timer %d to %.3f (cpu %d)\n",ns,id,double(expire)/1e9,cpu);
+}
+__attribute__((noinline,cold)) static void sched_log_cpu(const vf2::uint128_t &local,int id,bool suspended,int ran,int cycles,const vf2::uint128_t &target){
+    const double ns=double(local)/1e9;
+    if(sched_log_on(ns))std::fprintf(stderr,"[%.3f ns] cpu %d %s %d of %d cycles to %.3f (target %.3f)\n",ns,id,suspended?"ate":"ran",ran,cycles,ns,double(target)/1e9);
+}
+__attribute__((noinline,cold)) static void sched_log_fire(const vf2::uint128_t &expire,int id){
+    const double ns=double(expire)/1e9;
+    if(sched_log_on(ns))std::fprintf(stderr,"[%.3f ns] fire timer %d\n",ns,id);
+}
 
 model2a::atime model2a::time() const
 {
 	if (m_in_callback) return m_callback_time;
-	if (m_executing == CPU_I960) return m_sched[CPU_I960].local + atime(m_cpu.cycles_used()) * m_sched[CPU_I960].period;
-	if (m_executing == CPU_TGP) return m_sched[CPU_TGP].local + atime(m_tgp->cpu.cycles_used()) * m_sched[CPU_TGP].period;
-	if (m_executing == CPU_68K) return m_sched[CPU_68K].local + atime(m_68k->cycles_used()) * m_sched[CPU_68K].period;
+	if (m_executing == CPU_I960) {const auto &c=m_sched[CPU_I960];return c.local+(g_reference_duration?atime(m_cpu.cycles_used())*c.period:c.elapsed(m_cpu.cycles_used()));}
+	if (m_executing == CPU_TGP) {const auto &c=m_sched[CPU_TGP];return c.local+(g_reference_duration?atime(m_tgp->cpu.cycles_used())*c.period:c.elapsed(m_tgp->cpu.cycles_used()));}
+	if (m_executing == CPU_68K) {const auto &c=m_sched[CPU_68K];return c.local+(g_reference_duration?atime(m_68k->cycles_used())*c.period:c.elapsed(m_68k->cycles_used()));}
 	return m_base;
 }
 
+void model2a::rebuild_timer_queue(){
+    static_assert(N_TIMERS<128);
+    m_timer_first=-1;
+    std::fill_n(m_timer_prev,N_TIMERS,int8_t(-1));std::fill_n(m_timer_next,N_TIMERS,int8_t(-1));
+    if(!g_reference_timers)for(int i=0;i<N_TIMERS;i++)if(m_timer[i].enabled)timer_enqueue(i);
+}
+void model2a::timer_unlink(int id){
+    int before=m_timer_prev[id],after=m_timer_next[id];
+    if(before<0)m_timer_first=after;else m_timer_next[before]=after;
+    if(after>=0)m_timer_prev[after]=before;
+    m_timer_prev[id]=m_timer_next[id]=-1;m_head=m_timer_first;
+}
+void model2a::timer_enqueue(int id){
+    const timer &t=m_timer[id];int before=-1,after=m_timer_first;
+    while(after>=0){
+        const timer &other=m_timer[after];
+        if(t.expire<other.expire||(t.expire==other.expire&&t.seq<other.seq))break;
+        before=after;after=m_timer_next[after];
+    }
+    m_timer_prev[id]=before;m_timer_next[id]=after;
+    if(before<0)m_timer_first=id;else m_timer_next[before]=id;
+    if(after>=0)m_timer_prev[after]=id;
+    m_head=m_timer_first;
+}
 int model2a::timer_head() const
 {
-	if (m_head >= 0) return m_head;
-	int head = -1;
-	for (int i = 0; i < N_TIMERS; i++) {
-		const timer &t = m_timer[i];
-		if (!t.enabled) continue;
-		if (head < 0 || t.expire < m_timer[head].expire || (t.expire == m_timer[head].expire && t.seq < m_timer[head].seq)) head = i;
-	}
-	m_head = head;
-	return head;
+    if(m_head>=0)return m_head;
+    if(!g_reference_timers){m_head=m_timer_first;return m_head;}
+    SCHED_COUNT(++m_scheduler_diagnostics.head_scans);
+    int head=-1;
+    for(int i=0;i<N_TIMERS;i++){
+        const timer &t=m_timer[i];if(!t.enabled)continue;
+        if(head<0||t.expire<m_timer[head].expire||(t.expire==m_timer[head].expire&&t.seq<m_timer[head].seq))head=i;
+    }
+    m_head=head;return head;
 }
 
 void model2a::timer_disable(int id)
 {
+	if(!g_reference_timers&&m_timer[id].enabled)timer_unlink(id);
 	m_timer[id].enabled = false;
 	if (m_head == id) m_head = -1;
 	if (id == m_callback_timer) m_callback_modified = true;
@@ -1065,7 +1211,9 @@ void model2a::abort_timeslice()
 // emu_timer::adjust: a timer that becomes the first to fire ends the running CPU's slice
 void model2a::timer_adjust(int id, atime delay, u32 param, atime period)
 {
+	SCHED_COUNT(++m_scheduler_diagnostics.adjusted[id]);
 	timer &t = m_timer[id];
+	if(!g_reference_timers&&t.enabled)timer_unlink(id);
 	if (id == m_callback_timer) m_callback_modified = true;
 	t.param = param;
 	t.period = period;
@@ -1074,55 +1222,112 @@ void model2a::timer_adjust(int id, atime delay, u32 param, atime period)
 	t.expire = t.start + delay;
 	t.seq = ++m_timer_seq;
 	// keep the cached head: this one is the new head if it comes first, else unknown if it was
-	if (m_head == id) m_head = -1;
+	if(!g_reference_timers)timer_enqueue(id);
+	else if (m_head == id) m_head = -1;
 	else if (m_head >= 0 && t.expire < m_timer[m_head].expire) m_head = id;
-	SLOG(t.start, "adjust timer %d to %.3f (cpu %d)", id, double(t.expire) / 1e9, m_executing);
+	if(g_sched_log)sched_log_adjust(t.start,id,t.expire,m_executing);
 	if (timer_head() == id) abort_timeslice();
+}
+
+// FIFO and input-line synchronization schedule zero-delay one-shots. The
+// common strictly-earlier insertion needs neither a queue walk nor a
+// second head lookup. Equal timestamps retain the sequence-number order.
+void model2a::timer_sync(int id)
+{
+    SCHED_COUNT(++m_scheduler_diagnostics.sync_calls);
+    if(!g_sync_timer_fast||g_sched_log||g_reference_timers){
+        timer_adjust(id,0);
+        SCHED_COUNT(if(m_executing>=0&&timer_head()==id)++m_scheduler_diagnostics.sync_abort[m_executing]);
+        return;
+    }
+
+    SCHED_COUNT(++m_scheduler_diagnostics.adjusted[id]);
+    timer &t=m_timer[id];
+    if(t.enabled)timer_unlink(id);
+    if(id==m_callback_timer)m_callback_modified=true;
+    t.enabled=true;t.period=0;t.param=0;
+    t.start=t.expire=time();
+    t.seq=++m_timer_seq;
+
+    const int head=m_timer_first;
+    if(head<0||t.expire<m_timer[head].expire){
+        m_timer_prev[id]=-1;m_timer_next[id]=head;
+        if(head>=0)m_timer_prev[head]=id;
+        m_head=m_timer_first=id;
+        SCHED_COUNT(if(m_executing>=0)++m_scheduler_diagnostics.sync_abort[m_executing]);
+        abort_timeslice();
+        return;
+    }
+
+    timer_enqueue(id);
+    // An equal time can still sort first after loading a wrapped sequence.
+    if(m_timer_first==id){
+        SCHED_COUNT(if(m_executing>=0)++m_scheduler_diagnostics.sync_abort[m_executing]);
+        abort_timeslice();
+    }
 }
 
 // device_input::set_state_synced: queued, applied when the synchronize() timer fires
 void model2a::set_input_line(int line, int state)
 {
 	m_line_queue[line].push_back(state);
-	if (m_line_queue[line].size() == 1) timer_adjust(int(T_LINE0) + line, 0);
+	if (m_line_queue[line].size() == 1) timer_sync(int(T_LINE0) + line);
 }
 
 void model2a::apply_line(int line)
 {
-	std::vector<int> q;
-	q.swap(m_line_queue[line]);
-	for (int state : q) {
-		switch (line) {
-		case L_IRQ0: case L_IRQ1: case L_IRQ2: case L_IRQ3:
-			m_cpu.set_input_line(line - L_IRQ0, state);
-			break;
-		case L_I960_HALT:
-			if (state == ASSERT_LINE) suspend(CPU_I960, SUSPEND_HALT); else resume(CPU_I960, SUSPEND_HALT);
-			break;
-		case L_68K_IRQ0 + 0: case L_68K_IRQ0 + 1: case L_68K_IRQ0 + 2: case L_68K_IRQ0 + 3:
-		case L_68K_IRQ0 + 4: case L_68K_IRQ0 + 5: case L_68K_IRQ0 + 6: case L_68K_IRQ0 + 7: {
-			static const bool log = getenv("VF2_SND_LOG") != nullptr;
-			if (log) fprintf(stderr, "68k line %d %d at %llu (pc %06x, frame %llu)\n", line - L_68K_IRQ0, state, (unsigned long long)(time() / m_sched[CPU_68K].period), m_68k->pc(), (unsigned long long)m_frame_number);
-			m_68k->set_input_line(line - L_68K_IRQ0, state);
-			break;
+    auto &queue=m_line_queue[line];
+    SCHED_COUNT(if(queue.size()==1)++m_scheduler_diagnostics.single_line;
+                else if(!queue.empty())++m_scheduler_diagnostics.batched_line);
+    if(g_sync_timer_fast&&queue.size()==1){
+        const int state=queue.front();
+        queue.clear();
+        apply_line_state(line,state);
+        return;
+    }
+
+    std::vector<int> pending;
+    pending.swap(queue);
+    for(int state:pending)apply_line_state(line,state);
+    // A callback may have queued another event while applying this batch.
+    if(queue.empty()){
+        pending.clear();
+        pending.swap(queue);
+    }
+}
+
+void model2a::apply_line_state(int line,int state)
+{
+	switch (line) {
+	case L_IRQ0: case L_IRQ1: case L_IRQ2: case L_IRQ3:
+		m_cpu.set_input_line(line - L_IRQ0, state);
+		break;
+	case L_I960_HALT:
+		if (state == ASSERT_LINE) suspend(CPU_I960, SUSPEND_HALT); else resume(CPU_I960, SUSPEND_HALT);
+		break;
+	case L_68K_IRQ0 + 0: case L_68K_IRQ0 + 1: case L_68K_IRQ0 + 2: case L_68K_IRQ0 + 3:
+	case L_68K_IRQ0 + 4: case L_68K_IRQ0 + 5: case L_68K_IRQ0 + 6: case L_68K_IRQ0 + 7: {
+		static const bool log = getenv("VF2_SND_LOG") != nullptr;
+		if (log) fprintf(stderr, "68k line %d %d at %llu (pc %06x, frame %llu)\n", line - L_68K_IRQ0, state, (unsigned long long)(time() / m_sched[CPU_68K].period), m_68k->pc(), (unsigned long long)m_frame_number);
+		m_68k->set_input_line(line - L_68K_IRQ0, state);
+		break;
+	}
+	case L_TGP_HALT:
+		if (state == ASSERT_LINE) suspend(CPU_TGP, SUSPEND_HALT); else resume(CPU_TGP, SUSPEND_HALT);
+		break;
+	case L_TGP_RESET:
+		if (state == ASSERT_LINE) suspend(CPU_TGP, SUSPEND_RESET);
+		else if (m_sched[CPU_TGP].nextsuspend & SUSPEND_RESET) {
+			// device_t::reset(): the cycle count restarts, every suspension is lifted, the
+			// queued input line events are dropped
+			m_tgp_cycle_base = m_sched[CPU_TGP].cycles;
+			resume(CPU_TGP, ~0u);
+			m_tgp->cpu.reset();
+			m_line_queue[L_TGP_HALT].clear();
+			timer_disable(int(T_LINE0) + L_TGP_HALT);
+			resume(CPU_TGP, SUSPEND_RESET);
 		}
-		case L_TGP_HALT:
-			if (state == ASSERT_LINE) suspend(CPU_TGP, SUSPEND_HALT); else resume(CPU_TGP, SUSPEND_HALT);
-			break;
-		case L_TGP_RESET:
-			if (state == ASSERT_LINE) suspend(CPU_TGP, SUSPEND_RESET);
-			else if (m_sched[CPU_TGP].nextsuspend & SUSPEND_RESET) {
-				// device_t::reset(): the cycle count restarts, every suspension is lifted, the
-				// queued input line events are dropped
-				m_tgp_cycle_base = m_sched[CPU_TGP].cycles;
-				resume(CPU_TGP, ~0u);
-				m_tgp->cpu.reset();
-				m_line_queue[L_TGP_HALT].clear();
-				timer_disable(int(T_LINE0) + L_TGP_HALT);
-				resume(CPU_TGP, SUSPEND_RESET);
-			}
-			break;
-		}
+		break;
 	}
 }
 
@@ -1143,6 +1348,33 @@ void model2a::resume(int cpu, u32 reason)
 
 void model2a::apply_suspend_changes()
 {
+	if (g_fast_halt_delivery && !g_reference_timers && !g_sched_log) {
+		static constexpr auto orders = [] {
+			std::array<std::array<int, N_CPUS>, 1u << N_CPUS> table{};
+			for (unsigned mask = 0; mask < table.size(); ++mask) {
+				int position = 0;
+				for (unsigned suspended : { 0u, 1u })
+					for (int cpu = 0; cpu < N_CPUS; ++cpu)
+						if (((mask >> cpu) & 1u) == suspended)
+							table[mask][position++] = cpu;
+			}
+			return table;
+		}();
+		unsigned mask = 0;
+		u32 changed = 0;
+		for (int cpu = 0; cpu < N_CPUS; ++cpu) {
+			cpu_sched &c = m_sched[cpu];
+			changed |= c.suspend ^ c.nextsuspend;
+			c.suspend = c.nextsuspend;
+			c.eat = c.nexteat;
+			mask |= unsigned(c.suspend != 0) << cpu;
+		}
+		m_suspend_changes = false;
+		if (changed)
+			std::copy(orders[mask].begin(), orders[mask].end(), m_order);
+		return;
+	}
+
 	bool changed = false;
 	for (auto &c : m_sched) {
 		changed |= (c.suspend ^ c.nextsuspend) != 0;
@@ -1157,67 +1389,197 @@ void model2a::apply_suspend_changes()
 	}
 }
 
+__attribute__((noinline,cold)) void model2a::sync_instruction_hook(int id)
+{
+	if(id==CPU_I960)m_cpu.on_instruction=on_instruction?std::function<void(offs_t)>([this](offs_t pc){if(on_instruction)on_instruction(pc);}):nullptr;
+	else if(id==CPU_68K)m_68k->on_instruction=on_68k_instruction?std::function<void(offs_t)>([this](offs_t pc){if(on_68k_instruction)on_68k_instruction(pc&0xffffff);}):nullptr;
+}
+
 void model2a::timeslice()
 {
+    if(m_modular_frame){
+        const bool frame_division=g_frame_budget_division&&!g_reference_division;
+        // With the sound board live the 68000 must run in the same pass, so the
+        // modular clock keeps its uint64 arithmetic but loses LazyAux and the
+        // inert-handoff proof (which assumes only three non-deferred clocks).
+        if (m_sound_on) {
+            if (frame_division) timeslice_impl<false,true,true,true>();
+            else timeslice_impl<false,true,true>();
+        } else if (g_skip_inert_handoffs) {
+            if (frame_division) timeslice_impl<true,true,true,true,true>();
+            else timeslice_impl<true,true,true,false,true>();
+        } else if (frame_division) timeslice_impl<true,true,true,true>();
+        else timeslice_impl<true,true,true>();
+        return;
+    }
+	if(g_cooperative_fifo&&!m_cooperative_ready)prepare_cooperative_fifo();
+	// Cost probe only: take the lazy-aux path even with the board on, so a held
+	// 68000 is not visited for every synchronization. The board is independent
+	// of the i960, so the game still runs.
+	static const bool force_lazy_aux=std::getenv("VF2_FORCE_LAZY_AUX")!=nullptr;
+	if((g_lazy_aux_clocks&&!m_sound_on&&!m_sound_only)||(force_lazy_aux&&!m_sound_only)){
+        if(g_scheduler_gaps)timeslice_impl<true,true,false>();else timeslice_impl<true,false,false>();
+    }else{
+        if(g_scheduler_gaps)timeslice_impl<false,true,false>();else timeslice_impl<false,false,false>();
+    }
+}
+
+void model2a::advance_aux_clocks(const atime &target)
+{
+	if(!g_lazy_aux_clocks||m_sound_on||m_sound_only)return;
+	cpu_sched &c=m_sched[CPU_68K];
+	if(!(c.suspend&SUSPEND_HALT)||!c.eat||target<c.local)return;
+	SCHED_COUNT(++m_scheduler_diagnostics.visits[CPU_68K]);
+	const atime delta=target-c.local;if(delta<c.period)return;
+	// A halted processor has no side effects. Materialize its clock at observable
+	// boundaries instead of visiting it for every FIFO/timer synchronization.
+	// The full period is necessary for these larger gaps: the scheduler's shifted
+	// divisor approximation can round an extra cycle near a period boundary.
+	const uint64_t cycles=(delta>>64)?uint64_t(delta/c.period):uint64_t(delta)/uint64_t(c.period);
+	SCHED_COUNT(++m_scheduler_diagnostics.dispatches[CPU_68K];m_scheduler_diagnostics.budget[CPU_68K]+=cycles;m_scheduler_diagnostics.advanced[CPU_68K]+=cycles);
+	c.local+=atime(cycles)*c.period;c.cycles+=cycles;
+}
+
+template<bool LazyAux,bool NarrowGap,bool Modular,bool FrameDivision,bool SkipInert> void model2a::timeslice_impl()
+{
+    using clock_type=std::conditional_t<Modular,uint64_t,atime>;
+    auto clock=[](atime t)->clock_type {if constexpr(Modular)return uint64_t(t);else return t;};
+    auto less=[](clock_type a,clock_type b){if constexpr(Modular)return vf2::frame_clock::less(a,b);else return a<b;};
+    auto later=[&](clock_type a,clock_type b){return less(a,b)?b:a;};
+	SCHED_COUNT(++m_scheduler_diagnostics.slices);
 	int head = timer_head();
-	while (m_base < m_timer[head].expire) {
-		atime target = m_timer[head].expire;   // (MAME's 1/60 s quantum never comes first here)
+    bool new_head=false;
+	while (less(clock(m_base),clock(m_timer[head].expire))) {
+		SCHED_COUNT(++m_scheduler_diagnostics.passes);
+		const atime initial_target=m_timer[head].expire;
+        clock_type target=clock(initial_target);
+        auto absolute_target=[&]()->atime{if constexpr(Modular)return vf2::frame_clock::restore(initial_target,target);else return target;};   // (MAME's 1/60 s quantum never comes first here)
 		if (m_suspend_changes) apply_suspend_changes();
+        if constexpr(SkipInert){
+            // A guest may have inserted an earlier event. If all three
+            // non-deferred clocks are short of a cycle at that deadline,
+            // the original pass would only advance base to the event.
+            // Ignore suspension: this proof also holds for eating clocks.
+            const auto short_of_cycle=[&](int id){
+                const auto &c=m_sched[id];
+                return std::bit_cast<int64_t>(target-uint64_t(c.local))<int64_t(uint64_t(c.period));
+            };
+            if(new_head&&short_of_cycle(CPU_I960)&&short_of_cycle(CPU_TGP)&&short_of_cycle(CPU_Z80)){
+                m_base=initial_target;
+                break;
+            }
+        }
 		for (int k = 0; k < N_CPUS; k++) {
 			const int id = m_order[k];
+			if constexpr(!Modular)if(g_cooperative_fifo&&id==CPU_TGP)continue;
+			if constexpr(LazyAux)if(id==CPU_68K)continue;
+			SCHED_COUNT(++m_scheduler_diagnostics.visits[id]);
 			cpu_sched &c = m_sched[id];
-			if (m_sound_only && id != CPU_68K) { c.local = std::max(c.local, target); continue; }   // (a sound board alone)
-			if (!(c.suspend == 0 || c.eat) || target < c.local) continue;
-			const atime delta = target - c.local;
-			if (delta < c.period) continue;
-			const int cycles = int(u32((uint64_t(delta) >> c.divshift) / c.divisor));
+			if constexpr(!Modular)if (m_sound_only && id != CPU_68K) { c.local = std::max(c.local, target); continue; }   // (a sound board alone)
+			if (!(c.suspend == 0 || c.eat)) continue;
+            if constexpr(!NarrowGap)if(less(target,clock(c.local)))continue;
+			if constexpr(!Modular)if(g_cooperative_fifo&&g_cooperative_timed&&id==CPU_I960&&m_cooperative_cpu_ready>c.local){
+                if constexpr(NarrowGap)if(target<c.local)continue;
+                const uint64_t available=div_atime(target-c.local,c.period);
+                if(!available)continue;
+                const uint64_t needed=div_atime(m_cooperative_cpu_ready-c.local+c.period-1,c.period);
+                const uint64_t idle=std::min(available,needed);
+                c.local+=atime(idle)*c.period;c.cycles+=idle;m_cooperative_wait_cycles+=idle;
+                if(c.local<target)target=std::max(c.local,m_base);
+                continue;
+            }
+			clock_type delta;
+            if constexpr(Modular){
+                const uint64_t local=uint64_t(c.local);
+                if(less(target,local))continue;
+                delta=target-local;
+                if(delta<uint64_t(c.period))continue;
+            }else if constexpr(NarrowGap){
+                if(!vf2::scheduler_gap(target,c.local,uint64_t(c.period),delta))continue;
+            }else{delta=target-c.local;if(delta<c.period)continue;}
+			const uint64_t dividend=uint64_t(delta)>>c.divshift;
+			const int cycles=int(u32(FrameDivision?c.divide_cycles.divide_frame(dividend):
+                g_reference_division?dividend/c.divisor:c.divide_cycles(dividend)));
+			SCHED_COUNT(++m_scheduler_diagnostics.dispatches[id];m_scheduler_diagnostics.budget[id]+=uint64_t(cycles));
 			int ran = cycles;
 			if (c.suspend == 0) {
+				SCHED_COUNT(++m_scheduler_diagnostics.active[id]);
 				if (id == CPU_Z80)
 					ran = cycles + (cycles & 1);   // NOPs: two steps of 2 cycles
 				else {
 					m_executing = id;
 					// the instruction hooks put on the CPUs only while one is set (each costs a call an instruction)
-					if (id == CPU_I960 && bool(m_cpu.on_instruction) != bool(on_instruction))
-						m_cpu.on_instruction = on_instruction ? std::function<void(offs_t)>([this](offs_t pc) { if (on_instruction) on_instruction(pc); }) : nullptr;
-					if (id == CPU_68K && bool(m_68k->on_instruction) != bool(on_68k_instruction))
-						m_68k->on_instruction = on_68k_instruction ? std::function<void(offs_t)>([this](offs_t pc) { if (on_68k_instruction) on_68k_instruction(pc & 0xffffff); }) : nullptr;
+					if constexpr(!Modular)if (id == CPU_I960 && bool(m_cpu.on_instruction) != bool(on_instruction))
+						sync_instruction_hook(id);
+					if constexpr(!Modular)if (id == CPU_68K && bool(m_68k->on_instruction) != bool(on_68k_instruction))
+						sync_instruction_hook(id);
 					if (id == CPU_68K) {
+						static const bool sound_prof=getenv("VF2_SOUND_PROFILE")!=nullptr;
+						const uint64_t snd_t0=sound_prof?now_ns():0;
 						m_68k->set_total_base(c.cycles);
 						ran = m_68k->run(cycles);
+						if(sound_prof)m_sound_68k_ns+=now_ns()-snd_t0;
 					} else
-						ran = id == CPU_I960 ? m_cpu.run(cycles) : m_tgp->cpu.run(cycles);
+						ran = id == CPU_I960 ? m_cpu.run(cycles) : m_tgp->run(cycles);
+					// Complete partial command batches before timers can parse a frame.
+					if constexpr(!Modular)if(g_cooperative_fifo&&g_cooperative_batch>1&&id==CPU_I960&&!m_fifo_in.values.empty())service_cooperative_tgp();
 					m_executing = -1;
 					if (id == CPU_TGP) m_tgp_instructions += uint64_t(ran);
 				}
 			}
-			c.local += atime(ran) * c.period;
+			if constexpr(Modular)vf2::frame_clock::advance(c.local,uint64_t(ran)*uint64_t(c.period));
+            else c.local += g_reference_duration?atime(ran)*c.period:c.elapsed(ran);
+			SCHED_COUNT(m_scheduler_diagnostics.advanced[id]+=uint64_t(ran);m_scheduler_diagnostics.early[id]+=ran<cycles);
 			c.cycles += uint64_t(ran);
-			SLOG(c.local, "cpu %d %s %d of %d cycles to %.3f (target %.3f)", id, c.suspend ? "ate" : "ran", ran, cycles, double(c.local) / 1e9, double(target) / 1e9);
-			if (c.local < target) target = std::max(c.local, m_base);
+			if(g_sched_log)sched_log_cpu(c.local,id,c.suspend!=0,ran,cycles,absolute_target());
+			if (less(clock(c.local),target)) target=later(clock(c.local),clock(m_base));
 		}
-		m_base = target;
-		head = timer_head();
+		m_base = absolute_target();
+        const int next=timer_head();
+        if constexpr(SkipInert)new_head=next!=head;
+		head = next;
 	}
 	// execute_timers
-	while ((head = timer_head()) >= 0 && m_timer[head].expire <= m_base) {
+	while ((head = timer_head()) >= 0 && !less(clock(m_base),clock(m_timer[head].expire))) {
 		timer &t = m_timer[head];
 		const atime period = t.period;
+		constexpr int i960_halt = int(T_LINE0) + L_I960_HALT;
+		constexpr int tgp_halt = int(T_LINE0) + L_TGP_HALT;
+		if (g_fast_halt_delivery && g_sync_timer_fast && !g_reference_timers && !g_sched_log &&
+			!period && (head == i960_halt || head == tgp_halt)) {
+			auto &queue = m_line_queue[head - T_LINE0];
+			if (queue.size() == 1) {
+				// HALT delivery only updates the processor's pending suspension.
+				// Dequeue at the ordinary callback position to keep equal-time order.
+				const int state = queue.front();
+				queue.clear();
+				timer_disable(head);
+				m_callback_time = t.expire;
+				m_callback_modified = false;
+				SCHED_COUNT(++m_scheduler_diagnostics.fired[head]; ++m_scheduler_diagnostics.single_line);
+				const int cpu = head == i960_halt ? CPU_I960 : CPU_TGP;
+				if (state == ASSERT_LINE) suspend(cpu, SUSPEND_HALT);
+				else resume(cpu, SUSPEND_HALT);
+				continue;
+			}
+		}
 		if (!period) timer_disable(head);   // a one-shot timer
 		m_in_callback = true;
 		m_callback_time = t.expire;
 		m_callback_timer = head;
 		m_callback_modified = false;
-		if (head != T_UART) SLOG(t.expire, "fire timer %d", head);
+		SCHED_COUNT(++m_scheduler_diagnostics.fired[head]);
+		if(head!=T_UART&&g_sched_log)sched_log_fire(t.expire,head);
 		timer_fired(head);
 		m_in_callback = false;
 		m_callback_timer = -1;
 		// a periodic one goes again a period on, unless its callback changed it
 		if (period && !m_callback_modified) {
+			if(!g_reference_timers)timer_unlink(head);
 			t.start = t.expire;
 			t.expire += period;
 			t.seq = ++m_timer_seq;
-			m_head = -1;
+			if(!g_reference_timers)timer_enqueue(head);else m_head = -1;
 		}
 	}
 }
@@ -1250,6 +1612,8 @@ void model2a::timer_fired(int id)
 		break;
 	}
 	case T_VBLANK_END:   // MAME draws the screen here, then counts the frame
+		if(m_modular_frame&&m_vblank_tile_hook)(*m_vblank_tile_hook)();
+		m_video->geometry_wait();
 		render_wait();   // (a picture still being drawn: its polygons, before the next frame's)
 		if (m_draw_3d) m_video->frame_end(m_render_test_mode, m_frame_number);
 		m_frame_number++;
@@ -1296,6 +1660,36 @@ void model2a::run_until(uint64_t cycle)
 {
 	const atime t = atime(cycle) * m_sched[CPU_I960].period;
 	while (m_base < t) timeslice();
+	advance_aux_clocks(m_base);
+}
+
+// A frame's first vblank bounds every selected head deadline. Active CPUs
+// and expired timers start within one second of base; execution can advance
+// less than another second plus a vblank. All compared gaps stay far below
+// the signed low-limb half-range. Long future timers remain ordered in 128 bits.
+bool model2a::modular_frame_ready()const
+{
+    // Cost probe only: the board's presence disables this fast path. Take it
+    // away from the sound-off arm instead, to see whether the tail follows the
+    // path rather than the board.
+    static const bool no_modular=std::getenv("VF2_NO_MODULAR")!=nullptr;
+    if(no_modular)return false;
+    // The modular path was gated on the board being held because it skipped the
+    // 68000. timeslice() can run the 68000 in modular passes, so allow it back
+    // (opt-in until qualified on all three scenes).
+    static const bool modular_sound=std::getenv("VF2_MODULAR_SOUND")!=nullptr;
+    if(!g_modular_clock||!g_lazy_aux_clocks||g_reference_duration||(m_sound_on&&!modular_sound)||m_sound_only||g_cooperative_fifo||g_sched_log)return false;
+    if(on_instruction||on_68k_instruction||m_cpu.on_instruction||m_68k->on_instruction||m_tgp->cpu.on_instruction||on_copro||on_milestone||on_uart_tx||on_68k_scsp_write)return false;
+    const atime window=AS_PER_SEC;
+    if(m_base>(atime(1)<<100))return false;
+    const timer &v=m_timer[T_VBLANK_START];
+    if(!v.enabled||v.expire<m_base||v.expire-m_base>window)return false;
+    for(int id:{CPU_I960,CPU_TGP,CPU_Z80}){
+        const auto &c=m_sched[id];
+        if(!c.period||c.period>AS_PER_SEC/1000000||!vf2::frame_clock::near(c.local,m_base,uint64_t(window)))return false;
+    }
+    for(const auto &t:m_timer)if(t.enabled&&t.expire<m_base&&m_base-t.expire>window)return false;
+    return true;
 }
 
 // Runs to the end of the frame's vblank, where MAME draws the screen.
@@ -1317,7 +1711,10 @@ void model2a::run_frame()
 		write_dword(0x508000, read_dword(0x508000) | 0x4000);
 		m_sw = u8(m_sw & ~1);
 	}
-	while (m_frame_number == f) timeslice();
+	m_modular_frame=modular_frame_ready();if(m_modular_frame)++m_modular_frames;
+    while (m_frame_number == f) timeslice();
+    m_modular_frame=false;
+	advance_aux_clocks(m_base);
 	m_in1 = in_were[0]; m_in2 = in_were[1]; m_sw = sw_was;
 	take_audio();
 	m_scroll_hist[f % SCROLL_HIST] = { int64_t(f), m_tiles.tile_r(0x5002), m_tiles.tile_r(0x5006) };   // (smooth motion's backdrop)
@@ -1333,11 +1730,77 @@ void model2a::run_frame()
 //   copro_fifo_in:  i960 -> TGP     copro_fifo_out: TGP -> i960
 // ---------------------------------------------------------------------------------------------
 
+void model2a::prepare_cooperative_fifo()
+{
+    for(int id:{T_FIN_EMPTY,T_FIN_FULL,T_FOUT_EMPTY,T_FOUT_FULL})timer_disable(id);
+    for(int line:{L_I960_HALT,L_TGP_HALT}){
+        m_line_queue[line].clear();timer_disable(int(T_LINE0)+line);
+    }
+    for(int id:{CPU_I960,CPU_TGP}){m_sched[id].suspend&=~SUSPEND_HALT;m_sched[id].nextsuspend&=~SUSPEND_HALT;}
+    m_suspend_changes=true;
+    m_fifo_in.empty_triggered=m_fifo_in.full_triggered=false;
+    m_fifo_out.empty_triggered=m_fifo_out.full_triggered=false;
+    m_cooperative_ready=true;m_cooperative_pumping=m_cooperative_wait_input=false;
+    m_cooperative_cpu_ready=0;m_cooperative_output_ready.clear();
+    if(g_cooperative_timed)for(size_t i=0;i<m_fifo_out.values.size()+m_fifo_out.extra.size();++i)m_cooperative_output_ready.push_back(m_base);
+}
+
+bool model2a::cooperative_wait_until(const atime &ready)
+{
+    const atime now=time();if(ready<=now)return true;
+    const auto &c=m_sched[CPU_I960];
+    const uint64_t needed=div_atime(ready-now+c.period-1,c.period);
+    const int available=std::max(0,m_cpu.remaining_cycles());
+    const int idle=int(std::min(needed,uint64_t(available)));
+    m_cpu.wait_cycles(idle);m_cooperative_wait_cycles+=uint64_t(idle);
+    if(uint64_t(idle)==needed)return true;
+    m_cooperative_cpu_ready=ready;return false;
+}
+
+void model2a::service_cooperative_tgp()
+{
+    if(m_cooperative_pumping||m_executing!=CPU_I960||m_fifo_out.is_full()||(m_coproctl&0x80000000))return;
+    auto &c=m_sched[CPU_TGP];
+    if((c.suspend|c.nextsuspend)&SUSPEND_RESET)return;
+    if(m_cooperative_wait_input&&m_fifo_in.values.empty())return;
+    c.local=std::max(c.local,time());
+    const int saved=m_executing;m_executing=CPU_TGP;m_cooperative_pumping=true;
+    for(unsigned batch=0;batch<16;++batch){
+        m_cooperative_wait_input=false;
+        const int ran=m_tgp->run(65536);
+        c.local+=c.elapsed(ran);c.cycles+=uint64_t(ran);m_tgp_instructions+=uint64_t(ran);
+        ++m_cooperative_calls;m_cooperative_cycles+=uint64_t(ran);
+        if(m_cooperative_wait_input||m_fifo_out.is_full())break;
+        if(batch==15){std::fprintf(stderr,"Cooperative DSP budget exhausted at PC %04x\n",m_tgp->cpu.pc());std::abort();}
+    }
+    m_cooperative_pumping=false;m_executing=saved;
+}
+
+void model2a::report_cooperative_fifo(FILE *out)const
+{
+    if(g_cooperative_fifo)std::fprintf(out,"Cooperative FIFO: %llu DSP services, %llu cycles, max queued input %llu words, %llu i960 virtual wait cycles, input batch threshold %u\n",(unsigned long long)m_cooperative_calls,(unsigned long long)m_cooperative_cycles,(unsigned long long)m_cooperative_max_input,(unsigned long long)m_cooperative_wait_cycles,g_cooperative_batch);
+}
+
 u32 model2a::fifo_pop(bool out)
 {
 	gen_fifo &f = out ? m_fifo_out : m_fifo_in;
+	if(g_cooperative_fifo){
+        if(out)m_cooperative_read_waited=false;
+        if(out&&f.values.empty())service_cooperative_tgp();
+        if(f.values.empty()){
+            if(!out){m_cooperative_wait_input=true;m_tgp->cpu.stall();m_tgp->cpu.abort_timeslice();return 0;}
+            std::fprintf(stderr,"Cooperative output starvation at i960 PC %08x DSP PC %04x input %zu\n",m_cpu.pip(),m_tgp->cpu.pc(),m_fifo_in.values.size()+m_fifo_in.extra.size());std::abort();
+        }
+        if(out&&g_cooperative_timed&&!cooperative_wait_until(m_cooperative_output_ready.front())){
+            m_cooperative_read_waited=true;m_cpu.i960_stall();return 0;
+        }
+        const u32 value=f.values.front();f.values.pop_front();
+        if(out&&g_cooperative_timed)m_cooperative_output_ready.pop_front();
+        if(!f.extra.empty()){f.values.push_back(f.extra.front());f.extra.pop_front();}
+        return value;
+    }
 	if (f.values.empty()) {
-		timer_adjust(out ? T_FOUT_EMPTY : T_FIN_EMPTY, 0);
+		timer_sync(out ? T_FOUT_EMPTY : T_FIN_EMPTY);
 		if (out) m_cpu.i960_stall(); else m_tgp->cpu.stall();   // on_fifo_empty_pre_sync
 		return 0;
 	}
@@ -1357,11 +1820,22 @@ u32 model2a::fifo_pop(bool out)
 void model2a::fifo_push(bool out, u32 v)
 {
 	gen_fifo &f = out ? m_fifo_out : m_fifo_in;
+	if(g_cooperative_fifo){
+        if(out&&g_cooperative_timed)m_cooperative_output_ready.push_back(time());
+        if(f.is_full()||!f.extra.empty())f.extra.push_back(v);else f.values.push_back(v);
+        if(out){if(f.is_full())m_tgp->cpu.abort_timeslice();}
+        else{
+            m_cooperative_max_input=std::max(m_cooperative_max_input,uint64_t(f.values.size()+f.extra.size()));
+            if(f.extra.size()>65536){std::fprintf(stderr,"Cooperative input queue limit\n");std::abort();}
+            if(f.values.size()+f.extra.size()>=g_cooperative_batch)service_cooperative_tgp();
+        }
+        return;
+    }
 	if (!f.extra.empty())
 		f.extra.push_back(v);
 	else if (f.is_full()) {
 		f.extra.push_back(v);
-		timer_adjust(out ? T_FOUT_FULL : T_FIN_FULL, 0);
+		timer_sync(out ? T_FOUT_FULL : T_FIN_FULL);
 	} else {
 		f.values.push_back(v);
 		if (f.empty_triggered) {
@@ -1374,6 +1848,7 @@ void model2a::fifo_push(bool out, u32 v)
 void model2a::fifo_clear(bool out)
 {
 	gen_fifo &f = out ? m_fifo_out : m_fifo_in;
+	if(g_cooperative_fifo&&out)m_cooperative_output_ready.clear();
 	f.values.clear();
 	f.extra.clear();
 	timer_disable(out ? T_FOUT_EMPTY : T_FIN_EMPTY);
@@ -1384,12 +1859,38 @@ void model2a::fifo_clear(bool out)
 	}
 }
 
+void model2a::assert_fifo_halt(int line)
+{
+	// This is the last action of both FIFO synchronization callbacks.
+	const int id=int(T_LINE0)+line;
+	auto &halt=m_timer[id];
+	const int head=m_timer_first;
+	if (g_fuse_fifo_halt && g_fast_halt_delivery && g_sync_timer_fast &&
+		!g_reference_timers && !g_sched_log && m_in_callback &&
+		m_callback_timer>=0 && !m_timer[m_callback_timer].enabled &&
+		m_executing<0 && !halt.enabled && m_line_queue[line].empty() &&
+		(head<0 || m_callback_time<m_timer[head].expire)) {
+		// The queued HALT would be the next event, at the FIFO callback's
+		// time. Preserve its serialized timer fields, then assert the line
+		// without inserting and immediately unlinking a timer.
+		halt.start=halt.expire=m_callback_time;
+		halt.period=0;
+		halt.param=0;
+		halt.seq=++m_timer_seq;
+		SCHED_COUNT(++m_scheduler_diagnostics.sync_calls; ++m_scheduler_diagnostics.adjusted[id];
+		            ++m_scheduler_diagnostics.fired[id]; ++m_scheduler_diagnostics.single_line);
+		suspend(line==L_I960_HALT?CPU_I960:CPU_TGP,SUSPEND_HALT);
+		return;
+	}
+	set_input_line(line,ASSERT_LINE);
+}
+
 void model2a::fifo_sync_empty(bool out)
 {
 	gen_fifo &f = out ? m_fifo_out : m_fifo_in;
 	if (f.values.empty() && !f.empty_triggered) {
 		f.empty_triggered = true;
-		set_input_line(out ? L_I960_HALT : L_TGP_HALT, ASSERT_LINE);   // on_fifo_empty_post_sync
+		assert_fifo_halt(out ? L_I960_HALT : L_TGP_HALT);   // on_fifo_empty_post_sync
 	}
 }
 
@@ -1402,7 +1903,7 @@ void model2a::fifo_sync_full(bool out)
 	}
 	if (!f.extra.empty() && !f.full_triggered) {
 		f.full_triggered = true;
-		set_input_line(out ? L_TGP_HALT : L_I960_HALT, ASSERT_LINE);   // on_fifo_full_post_sync
+		assert_fifo_halt(out ? L_TGP_HALT : L_I960_HALT);   // on_fifo_full_post_sync
 	}
 }
 
@@ -1414,6 +1915,8 @@ namespace { constexpr u16 BURST = i960_cpu_device::BURST; }
 
 u16 model2a::flags(offs_t a)
 {
+	if (g_fifo_port_flags && (a & 3u) == 0 && a - 0x00884000u < 0x4000u)
+		return g_fifo_port_flags;
 	// the regions MAME maps with .flags(i960_cpu_device::BURST): ldl/ldt/ldq step through them,
 	// and repeat the same address everywhere else (the FIFOs)
 	if (a < 0x00240000) return BURST;                               // ROM, RAM
@@ -1436,11 +1939,14 @@ u16 model2a::flags(offs_t a)
 }
 
 // Plain memory: P points at the byte (ROM set for the read-only ones); devices leave it null.
-#define MEM_CASES(a, P, ROM)                                                                   \
+#define MEM_CASES(a, P, ROM, TrackWrite)                                                                   \
 	if (a < 0x00200000) { ROM = true; P = (u8 *)&m_rom[a]; }                                   \
 	else if (a < 0x00240000) P = &m_ram200[a - 0x00200000];                                    \
 	else if (a >= 0x00500000 && a < 0x00600000) P = &m_workram[a - 0x00500000];                \
-	else if (a >= 0x00900000 && a < 0x00980000) P = &m_bufferram[a & 0x1ffff];                 \
+	else if (a >= 0x00900000 && a < 0x00980000) {                                           \
+        if(g_cooperative_fifo&&g_cooperative_batch>1&&!m_fifo_in.values.empty())service_cooperative_tgp(); \
+        if constexpr(TrackWrite)if(g_track_geometry_pages)m_video->mark_geometry_page(a&0x1ffff); \
+        P = &m_bufferram[a & 0x1ffff]; }                                                   \
 	else if (a >= 0x00e00000 && a < 0x00e00038) P = &m_cpuctl[a - 0x00e00000];                 \
 	else if ((a & ~0x10000u) >= 0x01a00000 && (a & ~0x10000u) < 0x01a04000) P = &m_m2comm_share[a & 0x3fff]; \
 	else if (a >= 0x01d00000 && a < 0x01d04000) P = &m_backup[a - 0x01d00000];                 \
@@ -1456,20 +1962,35 @@ void model2a::map_plain_pages(i960rec::runtime &r)
 	r.wpage.assign(i960rec::runtime::PAGES, nullptr);
 	for (u32 pg = 0; pg < i960rec::runtime::PAGES; pg++) {
 		const u32 a = pg << 12, z = a + 0xfff;
+		// Deferred DSP commands must complete before either side of an i960
+		// shared-buffer access. Route these pages through the memory helpers.
+		if(g_cooperative_fifo&&g_cooperative_batch>1&&a>=0x00900000&&a<0x00980000)continue;
 		u8 *p = nullptr, *q = nullptr; bool rom = false, rom2 = false;
-		MEM_CASES(a, p, rom)
-		MEM_CASES(z, q, rom2)
+		MEM_CASES(a, p, rom, false)
+		MEM_CASES(z, q, rom2, false)
 		if (!p || q != p + 0xfff || rom != rom2 || flags(a) != BURST || flags(z) != BURST) continue;
 		r.rpage[pg] = p;
-		if (!rom) r.wpage[pg] = p;
+        // Writes through a mapped buffer page would bypass dirty tracking.
+        if (!rom && (!g_track_geometry_pages || a-0x00900000u>=0x80000u))
+            r.wpage[pg]=p;
 	}
+	r.timer_poll_context=this; r.collapse_timer_poll=collapse_i960_timer_poll;
+}
+u8 *model2a::direct_register_frame(offs_t a)
+{
+	const u32 offset = a - 0x00500000;
+	if (offset <= 0x000fffc0)
+		return m_workram.data() + offset;
+	return nullptr;
 }
 
 u32 model2a::read_dword(offs_t a)
 {
 	a &= ~3u;
+	if (g_fixed_fifo_load && a - 0x00884000u < 0x4000u)
+		return copro_fifo_r();
 	u8 *p = nullptr; bool rom = false;
-	MEM_CASES(a, p, rom)
+	MEM_CASES(a, p, rom, false)
 	if (p) { u32 v; memcpy(&v, p, 4); return v; }
 	return dev_read(a, 0xffffffff);
 }
@@ -1478,7 +1999,7 @@ u16 model2a::read_word(offs_t a)
 {
 	a &= ~1u;
 	u8 *p = nullptr; bool rom = false;
-	MEM_CASES(a, p, rom)
+	MEM_CASES(a, p, rom, false)
 	if (p) { u16 v; memcpy(&v, p, 2); return v; }
 	const int sh = (a & 2) * 8;
 	return u16(dev_read(a & ~3u, 0xffffu << sh) >> sh);
@@ -1487,7 +2008,7 @@ u16 model2a::read_word(offs_t a)
 u8 model2a::read_byte(offs_t a)
 {
 	u8 *p = nullptr; bool rom = false;
-	MEM_CASES(a, p, rom)
+	MEM_CASES(a, p, rom, false)
 	if (p) return *p;
 	const int sh = (a & 3) * 8;
 	return u8(dev_read(a & ~3u, 0xffu << sh) >> sh);
@@ -1496,8 +2017,13 @@ u8 model2a::read_byte(offs_t a)
 void model2a::write_dword(offs_t a, u32 v)
 {
 	a &= ~3u;
+	if (g_fixed_fifo_store && a - 0x00884000u < 0x4000u) {
+		if (on_copro) on_copro('w', a - 0x00880000, v);
+		copro_fifo_w(v);
+		return;
+	}
 	u8 *p = nullptr; bool rom = false;
-	MEM_CASES(a, p, rom)
+	MEM_CASES(a, p, rom, true)
 	if (p) { if (!rom) memcpy(p, &v, 4); return; }
 	dev_write(a, v, 0xffffffff);
 }
@@ -1506,7 +2032,7 @@ void model2a::write_word(offs_t a, u16 v)
 {
 	a &= ~1u;
 	u8 *p = nullptr; bool rom = false;
-	MEM_CASES(a, p, rom)
+	MEM_CASES(a, p, rom, true)
 	if (p) { if (!rom) memcpy(p, &v, 2); return; }
 	const int sh = (a & 2) * 8;
 	dev_write(a & ~3u, u32(v) << sh, 0xffffu << sh);
@@ -1515,7 +2041,7 @@ void model2a::write_word(offs_t a, u16 v)
 void model2a::write_byte(offs_t a, u8 v)
 {
 	u8 *p = nullptr; bool rom = false;
-	MEM_CASES(a, p, rom)
+	MEM_CASES(a, p, rom, true)
 	if (p) { if (!rom) *p = v; return; }
 	const int sh = (a & 3) * 8;
 	dev_write(a & ~3u, u32(v) << sh, 0xffu << sh);
@@ -1556,6 +2082,8 @@ u32 model2a::dev_read(u32 a, u32 mem_mask)
 		switch (a & 0x3f) {
 		case 0x00: return m_coproctl;
 		case 0x04:   // fifo_control_r: the TGP's output FIFO is empty
+			if(g_cooperative_fifo&&m_fifo_out.values.empty())service_cooperative_tgp();
+			if(g_cooperative_fifo&&g_cooperative_timed&&!m_fifo_out.values.empty()&&!cooperative_wait_until(m_cooperative_output_ready.front()))return 1;
 			return m_fifo_out.values.empty() ? 1 : 0;
 		case 0x0c: {
 			u8 framenum = !m_render_mode ? (m_framenum & 2) << 1 : (m_framenum & 1) << 2;
@@ -1575,8 +2103,18 @@ u32 model2a::dev_read(u32 a, u32 mem_mask)
 	if (a == 0x00e80004) return m_intena;
 	if (a >= 0x00f00000 && a < 0x00f00010) {
 		int n = (a >> 2) & 3;
-		if (m_timerrun[n])   // the elapsed time in 25 MHz ticks
-			m_timervals[n] = m_timerorig[n] - u32(div_atime(time() - m_timer[T_TIMER0 + n].start, m_sched[CPU_I960].period));
+		if (m_timerrun[n]) {
+            const auto &clock=m_sched[CPU_I960];
+            const auto elapsed=time()-m_timer[T_TIMER0+n].start;
+            uint64_t ticks;
+            if(g_i960_timer_reciprocal){
+                // The fixed 25 MHz period factors exactly into a power of
+                // two and the scheduler's cached 32-bit divisor.
+                const auto dividend=elapsed>>clock.divshift;
+                ticks=(dividend>>64)==0?clock.divide_cycles(uint64_t(dividend)):div_atime(elapsed,clock.period);
+            }else ticks=div_atime(elapsed,clock.period);
+            m_timervals[n]=m_timerorig[n]-u32(ticks);
+        }
 		return m_timervals[n];
 	}
 	const u32 t = a & ~0x110000u;
@@ -1643,6 +2181,7 @@ void model2a::dev_write(u32 a, u32 data, u32 mem_mask)
 		if (address < 0x1000) {
 			if (data & 0x80000000) {
 				u32 r = (data & 0x800fffff) | (((address >> 4) & 0x3f) << 23);
+				if(g_track_geometry_pages)m_video->mark_geometry_page(m_geo_write_start&0x1fffc);
 				memcpy(&m_bufferram[(m_geo_write_start / 4 * 4) & 0x1fffc], &r, 4);
 				m_geo_write_start += 4;
 			} else if ((address & 0xf) == 0) {
@@ -1651,6 +2190,7 @@ void model2a::dev_write(u32 a, u32 data, u32 mem_mask)
 					u8 function = (address >> 4) & 0x3f;
 					if (function == 1) r |= ((address >> 10) & 3) << 29;
 				}
+				if(g_track_geometry_pages)m_video->mark_geometry_page(m_geo_write_start&0x1fffc);
 				memcpy(&m_bufferram[(m_geo_write_start / 4 * 4) & 0x1fffc], &r, 4);
 				m_geo_write_start += 4;
 			}
@@ -1661,7 +2201,12 @@ void model2a::dev_write(u32 a, u32 data, u32 mem_mask)
 	}
 	if (a >= 0x00804000 && a < 0x00808000) {   // geo_prg_w
 		if (m_geoctl & 0x80000000) m_geocnt++;
-		else { memcpy(&m_bufferram[(m_geo_write_start / 4 * 4) & 0x1fffc], &data, 4); m_geo_write_start += 4; }
+		else {
+            const u32 offset=m_geo_write_start&0x1fffc;
+            if(g_track_geometry_pages)m_video->mark_geometry_page(offset);
+            memcpy(&m_bufferram[offset],&data,4);
+            m_geo_write_start+=4;
+        }
 		return;
 	}
 	if (a >= 0x00880000 && a < 0x00888000 && on_copro) on_copro('w', a - 0x00880000, data);
@@ -1834,6 +2379,7 @@ void model2a::copro_fifo_w(u32 data)
 {
 	if (m_coproctl & 0x80000000) {
 		m_tgp->prog[m_coprocnt & 0xfff] = data;
+		++m_tgp->program_revision_id;
 		m_coprocnt++;
 	} else
 		fifo_push(false, data);
@@ -1843,7 +2389,7 @@ u32 model2a::copro_fifo_r()
 {
 	const bool was_empty = m_fifo_out.values.empty();
 	const u32 v = fifo_pop(true);
-	if (!was_empty && on_copro) on_copro('r', 0x4000, v);
+	if (on_copro&&(g_cooperative_fifo?!m_cooperative_read_waited:!was_empty)) on_copro('r', 0x4000, v);
 	return v;
 }
 
@@ -1900,13 +2446,13 @@ void model2a::render_smooth(float alpha, u32 *out, size_t stride, bool async)
 	draw_picture(out, stride, true, async, std::clamp(alpha, 0.0f, 1.0f));
 }
 
-bool model2a::render_parts(float alpha, u32 *px3d, size_t stride3d, bool async, picture_parts &parts, const gpu3d_hook *gpu, bool gpu_only, bool also_cpu)
+bool model2a::render_parts(float alpha, u32 *px3d, size_t stride3d, bool async, picture_parts &parts, const gpu3d_hook *gpu, bool gpu_only, bool also_cpu, const gpu2d_hook *tiles, vblank_tiles early_tiles)
 {
 	render_wait();
 	if (m_video->shows_framebuffer()) return false;
 	if (gpu && gpu_only && m_ext && !wide_frame()) return false;   // (a 4:3 screen in a wide picture: its sides go by the 3D)
 	parts.gpu3d = false;
-	draw_picture(px3d, stride3d, true, async, alpha < 0 ? -1.0f : std::clamp(alpha, 0.0f, 1.0f), &parts, gpu, also_cpu);
+	draw_picture(px3d, stride3d, true, async, alpha < 0 ? -1.0f : std::clamp(alpha, 0.0f, 1.0f), &parts, gpu, also_cpu, tiles, early_tiles);
 	return true;
 }
 
@@ -2020,12 +2566,12 @@ void model2a::render_wait()
 // Before the RAM the 3D is coloured from changes (texture RAM, the palette from 0x1000, colorxlat,
 // lumaram): a picture being drawn finished, the deferred ones that can still be shown drawn.
 // (the GPU renderer's count of each RAM's changes: gpu3d_rams)
-void model2a::note_gpu_ram(int kind)
+void model2a::note_gpu_ram(int kind,u32 offset)
 {
 	switch (kind) {
 	case RAM_XLAT: m_video->note_ram(model2_video::GPU_XLAT); break;
-	case RAM_TEX0: m_video->note_ram(model2_video::GPU_TEX0); break;
-	case RAM_TEX1: m_video->note_ram(model2_video::GPU_TEX1); break;
+	case RAM_TEX0: m_video->note_ram(model2_video::GPU_TEX0,offset); break;
+	case RAM_TEX1: m_video->note_ram(model2_video::GPU_TEX1,offset); break;
 	case RAM_LUMA: m_video->note_ram(model2_video::GPU_LUMA); break;
 	}
 }
@@ -2033,7 +2579,7 @@ void model2a::note_gpu_ram(int kind)
 void model2a::before_3d_ram_change(int kind, u32 offset, u32 old, u32 now)
 {
 	render_wait();
-	note_gpu_ram(kind);
+	note_gpu_ram(kind,offset);
 	// (the 3D still to be shown drawn now, in the RAMs as they are, unless the lists and the
 	// changes are kept: then each is drawn when shown, the changes since taken back)
 	if (m_video->deferred() && (!m_video->smooth() || m_ram_log.size() >= 1000000)) {
@@ -2066,13 +2612,19 @@ void model2a::before_3d_ram_change(int kind, u32 offset, u32 old, u32 now)
 void model2a::ram_log_apply(uint64_t frame, bool undo)
 {
 	auto put = [&](const ram_change &c, u32 v) {
-		note_gpu_ram(c.kind);
+		note_gpu_ram(c.kind,c.offset);
 		switch (c.kind) {
-		case RAM_XLAT: m_colorxlat[c.offset] = u16(v); break;
+		case RAM_XLAT:
+            m_colorxlat[c.offset] = u16(v);
+            if(g_cache_2d_pens&&(c.offset&0xff)==0x40)m_palette_dirty=true;
+            break;
 		case RAM_TEX0: m_tex0[c.offset] = v; break;
 		case RAM_TEX1: m_tex1[c.offset] = v; break;
 		case RAM_LUMA: m_lumaram[c.offset] = u8(v); break;
-		case RAM_PAL: m_palram[c.offset] = u16(v); break;
+		case RAM_PAL:
+            m_palram[c.offset] = u16(v);
+            if(g_cache_2d_pens&&c.offset<0x1000)m_palette_dirty=true;
+            break;
 		}
 	};
 	if (undo) {
@@ -2168,7 +2720,7 @@ void model2a::redraw_into(const picture_desc &pic, u32 *out, size_t stride)
 	}
 }
 
-void model2a::draw_picture(u32 *out, size_t stride, bool polygons, bool async, float alpha, picture_parts *parts, const gpu3d_hook *gpu, bool also_cpu)
+void model2a::draw_picture(u32 *out, size_t stride, bool polygons, bool async, float alpha, picture_parts *parts, const gpu3d_hook *gpu, bool also_cpu, const gpu2d_hook *tiles, vblank_tiles early_tiles)
 {
 	const int s = m_scale, e = m_ext, w = WIDTH + 2 * e;
 	// smooth motion: the 2D drawn once a game frame, its in-between pictures reusing it
@@ -2177,7 +2729,7 @@ void model2a::draw_picture(u32 *out, size_t stride, bool polygons, bool async, f
 	const uint64_t key[] = { m_frame_number, uint64_t(s), uint64_t(e), uint64_t(m_backdrop_smooth), uint64_t(parts != nullptr),
 		uint64_t(uint32_t(m_fc_dx)) << 32 | uint32_t(m_fc_dy) | uint64_t(m_video->freecam_on()) << 31 };
 	if (!smoothly || memcmp(key, m_2d_key, sizeof key)) {
-		draw_2d(polygons, parts != nullptr);
+		draw_2d(polygons, parts != nullptr, tiles, early_tiles);
 		memcpy(m_2d_key, key, sizeof key);
 		if (!smoothly) m_2d_key[0] = ~0ull;
 	}
@@ -2225,9 +2777,10 @@ void model2a::draw_picture(u32 *out, size_t stride, bool polygons, bool async, f
 	if (parts) {
 		parts->w = w; parts->s = s;
 		parts->version = m_2d_version;
-		parts->backdrop = m_bd_pad.data();
-		parts->mid = &m_sys24_mid.pix(0);
-		parts->top = &m_sys24_top.pix(0);
+		parts->gpu2d = m_gpu2d_active;
+		parts->backdrop = m_gpu2d_active ? nullptr : m_bd_pad.data();
+		parts->mid = m_gpu2d_active ? nullptr : &m_sys24_mid.pix(0);
+		parts->top = m_gpu2d_active ? nullptr : &m_sys24_top.pix(0);
 		parts->filter = smooth;
 		parts->bdx = bdx; parts->bdy = bdy;
 		parts->sides = 0;
@@ -2384,20 +2937,83 @@ void model2a::draw_picture(u32 *out, size_t stride, bool polygons, bool async, f
 // The 2D at the arcade's resolution: m_sys24, the backdrop (maps 2 and 3, opaque); m_sys24_mid,
 // the layers over it under the 3D; m_sys24_top, the layers over the 3D. With the background
 // filter the backdrop softened too; for render_parts the backdrop padded.
-void model2a::draw_2d(bool polygons, bool parts)
+void model2a::prepare_tile_planes()
 {
-	if (m_palette_dirty)
+	if (m_palette_dirty) {
 		for (int i = 0; i < 0x1000; i++) set_pen(i);
+        if(g_cache_2d_pens)m_palette_dirty=false;
+    }
+    static const bool check_pens=getenv("VF2_HASH_2D_PENS")!=nullptr;
+    if(check_pens){
+        const auto *bytes=reinterpret_cast<const u8 *>(m_pens.data());
+        const auto hash=m2::state_hash(bytes,0x1000*sizeof(m_pens[0]));
+        std::fprintf(stderr,"System 24 pens: %llu %016llx\n",(unsigned long long)m_frame_number,(unsigned long long)hash);
+    }
+	m_tiles.update(m_pens.data());
+}
+
+bool model2a::custom_hud_names()
+{
+    std::lock_guard<std::mutex> lock(m_hud_mx);
+    return !m_hud_names[0].empty()||!m_hud_names[1].empty()||!m_random_hud[0].empty()||!m_random_hud[1].empty();
+}
+
+void model2a::build_gpu_tile_frame(bool hud_off,gpu2d_frame &frame)
+{
+    for(auto &pass:frame.passes)pass.clear();
+    m_tiles.gpu_data(frame);
+    for(int layer=3;layer>=2;layer--)m_tiles.gpu_draw(frame.passes[0],m_sys24,layer<<1,segas24_tile::DRAW_OPAQUE);
+    for(int layer=1;layer>=0;layer--)m_tiles.gpu_draw(frame.passes[1],m_sys24_mid,layer<<1,0);
+    for(int layer=3;layer>=(hud_off?2:0);layer--)m_tiles.gpu_draw(frame.passes[2],m_sys24_top,(layer<<1)|1,0);
+}
+
+void model2a::publish_gpu_tiles()
+{
+    m_gpu2d_active=true;
+    m_2d_wide=false;
+    m_2d_filter=false;
+    ++m_2d_version;
+}
+
+bool model2a::prepare_vblank_tiles(gpu2d_frame &frame)
+{
+    // At VBLANK end the guest has finished updating these tile inputs.
+    // The descriptor borrows board storage until the next simulation begins.
+    if(m_scale!=1||m_ext||m_render_test_mode||m_video->smooth()||m_video->freecam_on()||
+       m_random||!m_rank_names.empty()||custom_hud_names())return false;
+    prepare_tile_planes();
+    build_gpu_tile_frame(m_hud_hidden&&game_mode()==9,frame);
+    return true;
+}
+
+void model2a::draw_2d(bool polygons, bool parts, const gpu2d_hook *tiles, vblank_tiles early_tiles)
+{
+    if(early_tiles==vblank_tiles::staged){
+        publish_gpu_tiles();
+        return;
+    }
+    m_gpu2d_active=false;
+    // A declined stage can retry from the same planes and dirty entries.
+    // A second update here would discard that frame's dirty list.
+    if(early_tiles==vblank_tiles::unavailable)prepare_tile_planes();
 	const int s = m_scale, e = m_ext, w = WIDTH + 2 * e;
 	const bool wide = wide_frame();
 	const rectangle clip(0, WIDTH - 1, 0, HEIGHT - 1);
-	m_tiles.update(m_pens.data());
 	// the 2D at the arcade's resolution, its column 0 at e; in a wide frame the backdrop's maps
 	// (2 and 3) carry on to the sides, from the stage's panorama where it's known
 	const bool fc = polygons && m_video->freecam_on() && freecam_scene();   // (the free camera: no HUD, the backdrop moved)
 	const segas24_tile::panorama *pan = wide || fc ? find_panorama() : nullptr;
 	// the three bitmaps at once, each on a thread (the tiles' planes are only read)
 	const bool hud_off = (m_hud_hidden && game_mode() == 9) || fc;   // (Display > HUD Off, in a fight: maps 0 and 1 not drawn over the 3D)
+
+    if(tiles&&parts&&s==1&&e==0&&!wide&&!fc&&!m_video->smooth()&&!custom_hud_names()){
+        gpu2d_frame frame;
+        build_gpu_tile_frame(hud_off,frame);
+        if((*tiles)(frame)){
+            publish_gpu_tiles();
+            return;
+        }
+    }
 	m_tiles.m_ox = e;
 	parallel_tasks(3, [&](int task) {
 		const rectangle all(0, w - 1, 0, HEIGHT - 1);
@@ -3540,8 +4156,11 @@ void model2a::set_volumes(float music, float effects)
 
 void model2a::sound_update_tick()
 {
+	static const bool sound_prof=getenv("VF2_SOUND_PROFILE")!=nullptr;
+	const uint64_t snd_t0=sound_prof?now_ns():0;
 	m_scsp->update();
 	take_audio();
+	if(sound_prof){m_sound_scsp_ns+=now_ns()-snd_t0;++m_sound_scsp_updates;}
 }
 
 // The samples the SCSP has made so far: to the host at the output gain (MVOL / 15), as 16-bit.
@@ -3552,8 +4171,10 @@ void model2a::take_audio()
 	if (o.empty()) return;
 	const float g = m_scsp->output_gain();
 	auto s16 = [](double v) { return int16_t(std::clamp(std::lround(v * 32768.0), -32768l, 32767l)); };
+	// Probe: the loudest sample this run produced, to prove the stream is not silence.
+	auto level = [&](int16_t s) { const int a = s < 0 ? -int(s) : int(s); if (a > m_sound_peak) m_sound_peak = a; };
 	if (m_sound_on && m_level == 1.0f)
-		for (float v : o) m_audio_out.push_back(s16(double(v) * g));
+		for (float v : o) { const int16_t s = s16(double(v) * g); level(s); m_audio_out.push_back(s); }
 	else if (m_sound_on) {
 		constexpr float CEILING = 0.891f, RELEASE = 1.0f / (0.1f * SOUND_RATE);
 		for (size_t i = 0; i + 1 < o.size(); i += 2) {
@@ -3561,8 +4182,10 @@ void model2a::take_audio()
 			const float peak = std::max(std::fabs(l), std::fabs(r));
 			const float want = peak > CEILING ? CEILING / peak : 1.0f;
 			m_limit = want < m_limit ? want : m_limit + (want - m_limit) * RELEASE;
-			m_audio_out.push_back(s16(l * m_limit));
-			m_audio_out.push_back(s16(r * m_limit));
+			const int16_t ls = s16(l * m_limit), rs = s16(r * m_limit);
+			level(ls); level(rs);
+			m_audio_out.push_back(ls);
+			m_audio_out.push_back(rs);
 		}
 	}
 	if (m_keep_raw) m_audio_raw.insert(m_audio_raw.end(), o.begin(), o.end());
@@ -3601,6 +4224,7 @@ void model2a::snd_link_byte()
 
 uint64_t model2a::snd_cycles() const
 {
+	const_cast<model2a*>(this)->advance_aux_clocks(m_base);
 	const cpu_sched &c = m_sched[CPU_68K];
 	return c.cycles + (m_executing == CPU_68K ? uint64_t(m_68k->cycles_used()) : 0);
 }
@@ -3717,7 +4341,7 @@ void model2a::uart_write(int offset, u8 data)
 // step changes nothing unless a byte is waiting or the interrupt can be asked for again.
 // ---------------------------------------------------------------------------------------------
 
-namespace { constexpr unsigned __int128 LINK_EDGE = 1000000000000000000ull / 500000; }   // TxC's period (2 us)
+namespace { constexpr vf2::uint128_t LINK_EDGE = 1000000000000000000ull / 500000; }   // TxC's period (2 us)
 
 uint64_t model2a::link_edges(atime t) const { return div_atime(t, LINK_EDGE); }   // the falls up to t
 
@@ -3769,3 +4393,41 @@ void model2a::link_event()
 	link_schedule();
 }
 
+
+void model2a::reset_scheduler_stats(){
+#if defined(VF2_SCHED_DIAGNOSTICS)
+    m_scheduler_diagnostics={};
+#endif
+}
+void model2a::report_scheduler_stats(FILE *out)const{
+#if defined(VF2_SCHED_DIAGNOSTICS)
+    const auto &d=m_scheduler_diagnostics;
+    std::fprintf(out,"Scheduler: %llu calls, %llu passes, %llu timer-head scans\n",(unsigned long long)d.slices,(unsigned long long)d.passes,(unsigned long long)d.head_scans);
+    std::fprintf(out,"Scheduler sync: %llu schedules, %llu single-line deliveries, %llu batch deliveries; %llu i960 and %llu TGP slice abort requests\n",
+                 (unsigned long long)d.sync_calls,(unsigned long long)d.single_line,
+                 (unsigned long long)d.batched_line,(unsigned long long)d.sync_abort[CPU_I960],
+                 (unsigned long long)d.sync_abort[CPU_TGP]);
+    const char *names[]={"i960","TGP","68K","Z80"};
+    for(unsigned i=0;i<N_CPUS;i++)std::fprintf(out,"Scheduler %s: %llu visits, %llu dispatches, %llu active, %.2f budget/dispatch, %.2f cycles/dispatch, %llu early returns\n",names[i],(unsigned long long)d.visits[i],(unsigned long long)d.dispatches[i],(unsigned long long)d.active[i],d.dispatches[i]?double(d.budget[i])/d.dispatches[i]:0,d.dispatches[i]?double(d.advanced[i])/d.dispatches[i]:0,(unsigned long long)d.early[i]);
+    for(unsigned i=0;i<N_TIMERS;i++)if(d.adjusted[i]||d.fired[i])std::fprintf(out,"Scheduler timer %u: %llu adjustments, %llu firings\n",i,(unsigned long long)d.adjusted[i],(unsigned long long)d.fired[i]);
+#else
+    (void)out;
+#endif
+}
+#undef SCHED_COUNT
+
+void model2a::collapse_i960_timer_poll(void *context,u32 limit,u32 &counter,int &budget)
+{
+    auto &board=*static_cast<model2a *>(context);
+    if(!board.m_modular_frame||board.m_in_callback||board.m_executing!=CPU_I960||
+            board.m_workram[0]||!board.m_timerrun[2]||
+            board.m_sched[CPU_I960].period!=AS_PER_SEC/25000000||
+            counter!=(board.m_timervals[2]&i960rec::timer_poll_mask))return;
+
+    // The preceding real iteration sampled the countdown at the same cycle
+    // offset. Update the board's latched timer value as the last read would.
+    const auto elapsed=i960rec::timer_poll_elapsed(counter,limit,budget);
+    board.m_timervals[2]-=elapsed;
+    counter-=elapsed;
+    budget-=int(elapsed);
+}

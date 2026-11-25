@@ -199,6 +199,7 @@
 #include "romset.h"
 #include "png.h"
 #include "input_script.h"
+#include "arcade_stage_selection.h"
 #include "free_cam_path.h"
 #include "scene_sync.h"
 #include "backgrounds.h"
@@ -502,17 +503,9 @@ bool g_match_board = false;   // (an online match's board: the host's settings a
 // game as ever (a challenger later in it on the game's own stage). Offline only: never on an online match's board.
 static void stage_select(model2a &m, int stage)
 {
-	constexpr uint32_t LADDER = 0x54;
-	auto &ram = const_cast<std::vector<u8> &>(m.workram());
 	static bool set = false;   // (the count set, for this fight: the game's own again in a 1P game)
-	if (set && m.game_mode() == 9) {   // (the fight: a versus, or 1P)
-		if (ram[vf2net::VERSUS] == 0 && ram[vf2net::FIGHTS] == u8(stage)) ram[vf2net::FIGHTS] = 0;
-		set = false;
-	}
-	if (stage <= 0 || m.game_mode() != 6 || ram[vf2net::FIGHTS] != 0 || ram[vf2net::STREAK] != 0 || ram[LADDER] != 1) return;
-	ram[vf2net::FIGHTS] = ram[vf2net::STAGE] = u8(stage);
-	set = true;
-	fprintf(stderr, "Arcade settings > Stage select: a versus from this select on stage %d%s\n", stage + 1, stage == vf2net::STAGES ? " (Dural's)" : "");
+	if (select_arcade_versus_stage(m, stage, set))
+		fprintf(stderr, "Arcade settings > Stage select: a versus from this select on stage %d%s\n", stage + 1, stage == vf2net::STAGES ? " (Dural's)" : "");
 }
 
 struct pad_state

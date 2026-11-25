@@ -6,7 +6,13 @@
 // Galibert), by way of vf1-recomp; draw_sides draws past the arcade's edges for widescreen.
 #pragma once
 #include "mame_lite.h"
+#include "../gpu/gpu2d.h"
 #include <map>
+#include <cstring>
+#include <cstdlib>
+#if defined(__ARM_NEON) && defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#include <arm_neon.h>
+#endif
 
 class segas24_tile
 {
@@ -90,6 +96,7 @@ public:
 	// tilemaps mark their tiles dirty).
 	void update(const uint32_t *pens)
 	{
+		m_decoded.clear();++m_decode_version;
 		m_pens = pens;
 		if (m_dirty || pix[0].empty()) {
 			m_dirty = false;
@@ -120,19 +127,38 @@ public:
 		if (vscr & 0x8000)
 			return;
 
+		static const bool merge_line_scroll = std::getenv("VF2_COALESCE_LINE_SCROLL") != nullptr;
+		const bool coalesce = m_gpu_rects && merge_line_scroll;
+
 		if (ctrl & 0x6000) {
 			// Window/scroll split modes, drawn through the generic scrolled path.
 			if (layer & 1)
 				return;
 			int sy = vscr & 0x1ff;
 			if (hscr & 0x8000) {
+				static const bool gpu_line_scroll = std::getenv("VF2_GPU_LINE_SCROLL") != nullptr;
+				static const bool opaque_only = std::getenv("VF2_GPU_LINE_SCROLL_OPAQUE_ONLY") != nullptr;
+				if (m_gpu_rects && gpu_line_scroll && (!opaque_only || (flags_in & DRAW_OPAQUE))) {
+					m_gpu_rects->push_back({cliprect.min_x, cliprect.min_y, cliprect.max_x + 1, cliprect.max_y + 1,
+						0, sy, layer, -1, 0, int(tpri), bool(flags_in & DRAW_OPAQUE), true});
+					return;
+				}
 				const uint16_t *hscrtb = &tile_ram[0x4000 + 0x200 * layer];
-				for (int y = cliprect.min_y; y <= cliprect.max_y; y++) {
-					rectangle c = cliprect; c.min_y = c.max_y = y;
-					uint16_t h = hscrtb[y] & 0x1ff;
+				const bool vertical_split = (ctrl & 0x6000) == 0x2000;
+				const uint16_t v = (-vscr) & 0x1ff;
+				const uint16_t scroll_mask = vertical_split ? 0x1ff : 0x3ff;
+				for (int y = cliprect.min_y; y <= cliprect.max_y;) {
+					const uint16_t scroll = hscrtb[y] & scroll_mask;
+					const uint16_t h = scroll & 0x1ff;
+					int end = y + 1;
+					if (coalesce) {
+						const int limit = vertical_split && y < v ?
+							std::min(cliprect.max_y + 1, int(v)) : cliprect.max_y + 1;
+						while (end < limit && (hscrtb[end] & scroll_mask) == scroll) ++end;
+					}
+					rectangle c = cliprect; c.min_y = y; c.max_y = end - 1;
 					int l1 = layer;
-					if (((ctrl & 0x6000) >> 13) == 1) {
-						uint16_t v = (-vscr) & 0x1ff;
+					if (vertical_split) {
 						if (!((-vscr) & 0x200)) l1 ^= 1;
 						if (y >= v) l1 ^= 1;
 						draw_scrolled(bitmap, c, l1, -h, sy, tpri, flags_in);
@@ -140,10 +166,11 @@ public:
 						rectangle c1 = c, c2 = c;
 						if (c1.max_x >= h) c1.max_x = h - 1;
 						if (c2.min_x < h) c2.min_x = h;
-						if (!(hscrtb[y] & 0x200)) l1 ^= 1;
+						if (!(scroll & 0x200)) l1 ^= 1;
 						draw_scrolled(bitmap, c1, l1, -h, sy, tpri, flags_in);
 						draw_scrolled(bitmap, c2, l1 ^ 1, -h, sy, tpri, flags_in);
 					}
+					y = end;
 				}
 			} else {
 				int sx = -(hscr & 0x1ff);
@@ -169,15 +196,22 @@ public:
 		if (hscr & 0x8000) {
 			const uint16_t *hscrtb = &tile_ram[0x4000 + 0x200 * layer];
 			vscr &= 0x1ff;
-			for (int y = 0; y < 384; y++) {
-				uint16_t h = (-hscrtb[y]) & 0x1ff;
-				if (h + 496 <= 512)
-					draw_rect(layer, bitmap, mask, tpri, flags_in, win, h, vscr, 0, y, 496, y + 1);
-				else {
-					draw_rect(layer, bitmap, mask, tpri, flags_in, win, h, vscr, 0, y, 512 - h, y + 1);
-					draw_rect(layer, bitmap, mask, tpri, flags_in, win, 0, vscr, 512 - h, y, 496, y + 1);
+			for (int y = 0; y < 384;) {
+				const uint16_t h = (-hscrtb[y]) & 0x1ff;
+				int end = y + 1;
+				if (coalesce) {
+					// A band uses affine texture coordinates and cannot cross map wrap.
+					const int limit = std::min(384, y + 512 - vscr);
+					while (end < limit && ((-hscrtb[end]) & 0x1ff) == h) ++end;
 				}
-				vscr = (vscr + 1) & 0x1ff;
+				if (h + 496 <= 512)
+					draw_rect(layer, bitmap, mask, tpri, flags_in, win, h, vscr, 0, y, 496, end);
+				else {
+					draw_rect(layer, bitmap, mask, tpri, flags_in, win, h, vscr, 0, y, 512 - h, end);
+					draw_rect(layer, bitmap, mask, tpri, flags_in, win, 0, vscr, 512 - h, y, 496, end);
+				}
+				vscr = (vscr + end - y) & 0x1ff;
+				y = end;
 			}
 		} else {
 			hscr = (-hscr) & 0x1ff;
@@ -204,6 +238,14 @@ public:
 	}
 
 	std::vector<uint16_t> char_ram, tile_ram;
+	// Export exactly the rectangles used by draw(), retaining split/scroll rules.
+	void gpu_draw(std::vector<gpu2d_rect> &out,bitmap_rgb32 &bounds,int layer,int fl) {
+		m_gpu_rects=&out;draw(bounds,rectangle(0,495,0,383),layer,0,fl);m_gpu_rects=nullptr;
+	}
+	void gpu_data(gpu2d_frame &frame)const {
+		for(int i=0;i<4;i++){frame.pixels[i]=pix[i].data();frame.flags[i]=flags[i].data();}
+		frame.tile_ram=tile_ram.data();frame.pens=m_pens;frame.dirty=m_decoded.data();frame.dirty_count=m_decoded.size();frame.version=m_decode_version;
+	}
 	int m_ox = 0;   // destination x of the arcade's column 0 (widescreen draws centre the picture)
 
 	// Widescreen: a panorama a layer's map holds part of. `entries` is `cols` x `rows` map entries
@@ -406,14 +448,36 @@ private:
 	std::vector<uint16_t> pix[4];
 	std::vector<uint8_t> flags[4];
 	const uint32_t *m_pens = nullptr;
+	std::vector<uint16_t> m_decoded;
+	uint64_t m_decode_version=0;
+	std::vector<gpu2d_rect> *m_gpu_rects=nullptr;
 	bool m_dirty = true;   // everything to decode again
 	uint8_t m_entry_dirty[0x4000] = {}, m_char_dirty[0x4000] = {};
 	bool m_entries_dirty = false, m_chars_dirty = false;
 
 	uint8_t m_hide_frames = 0;   // (hide_frames)
 	std::map<uint16_t, uint16_t> m_subst;   // (substitute)
+#if defined(__ARM_NEON) && defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	static inline const bool neon_decode = std::getenv("VF2_S24_NEON_DECODE") != nullptr;
+	static void decode_four_rows(const uint16_t *words, uint16_t *pens, uint8_t *flags,
+	                             uint16x8_t color, uint8x8_t category)
+	{
+		// The two words of each row are in order. Swap their bytes
+		// separately, then interleave each byte's high and low pixels.
+		const auto bytes = vrev16q_u8(vreinterpretq_u8_u16(vld1q_u16(words)));
+		const auto pixels = vzipq_u8(vshrq_n_u8(bytes, 4), vandq_u8(bytes, vdupq_n_u8(15)));
+		const uint8x8_t rows[] = {vget_low_u8(pixels.val[0]), vget_high_u8(pixels.val[0]),
+		                         vget_low_u8(pixels.val[1]), vget_high_u8(pixels.val[1])};
+		for (unsigned row = 0; row < 4; ++row) {
+			const auto values = rows[row];
+			vst1q_u16(pens + row * 512, vorrq_u16(color, vmovl_u8(values)));
+			vst1_u8(flags + row * 512, vbic_u8(category, vceq_u8(values, vdup_n_u8(0))));
+		}
+	}
+#endif
 	void decode_entry(int e)
 	{
+		m_decoded.push_back(uint16_t(e));
 		const int l = e >> 12, ty = (e >> 6) & 63, tx = e & 63;
 		auto &pm = pix[l];
 		auto &fm = flags[l];
@@ -424,6 +488,16 @@ private:
 		uint32_t color = (val >> 7) & 0xff;
 		uint8_t cat = (val & 0x8000) ? 1 : 0;
 		const uint16_t *c = &char_ram[(code * 16) & 0x3ffff];
+#if defined(__ARM_NEON) && defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+		if (neon_decode) {
+			const auto color_base = vdupq_n_u16(uint16_t(color * 16));
+			const auto category = vdup_n_u8(uint8_t(0x10 | cat));
+			const size_t base = size_t(ty * 512 + tx) * 8;
+			decode_four_rows(c, pm.data() + base, fm.data() + base, color_base, category);
+			decode_four_rows(c + 8, pm.data() + base + 4 * 512, fm.data() + base + 4 * 512, color_base, category);
+			return;
+		}
+#endif
 		for (int y = 0; y < 8; y++) {
 			uint16_t w0 = c[y * 2], w1 = c[y * 2 + 1];
 			uint32_t row = (uint32_t(w0) << 16) | w1;
@@ -446,6 +520,16 @@ private:
 		uint8_t want = uint8_t(tpri | 0x10);
 		// c is in arcade pixels (0..495); the destination is offset by m_ox
 		const int x0 = std::max({c.min_x, 0, -m_ox}), x1 = std::min({c.max_x, 495, bm.width() - 1 - m_ox});
+		if(m_gpu_rects){
+			int y0=std::max(c.min_y,0),y1=std::min({c.max_y,383,bm.height()-1});
+			for(int y=y0;y<=y1;){
+				int sy=(y+scrolly)&511,h=std::min(y1+1-y,512-sy);
+				for(int x=x0;x<=x1;){int sx=(x+scrollx)&511,w=std::min(x1+1-x,512-sx);
+					m_gpu_rects->push_back({x,y,x+w,y+h,sx,sy,l,-1,0,int(tpri),bool(fl&DRAW_OPAQUE)});x+=w;}
+				y+=h;
+			}
+			return;
+		}
 		for (int y = std::max(c.min_y, 0); y <= std::min({c.max_y, 383, bm.height() - 1}); y++)
 			for (int x = x0; x <= x1; x++) {
 				size_t i = size_t((y + scrolly) & 511) * 512 + ((x + scrollx) & 511);
@@ -459,6 +543,10 @@ private:
 	void draw_rect(int l, bitmap_rgb32 &dm, const uint16_t *mask, uint16_t tpri, int fl, int win,
 				   int sx, int sy, int xx1, int yy1, int xx2, int yy2)
 	{
+		if(m_gpu_rects){
+			int mask_index=int((mask-tile_ram.data()-0x6000)/0x800);
+			m_gpu_rects->push_back({xx1,yy1,xx2,yy2,sx,sy,l,mask_index,win,int(tpri),bool(fl&DRAW_OPAQUE)});return;
+		}
 		tpri |= 0x10;
 		int dst_x = xx1;            // MAME takes the destination before the group shift
 		mask += yy1 * 4;
@@ -476,13 +564,26 @@ private:
 				uint16_t m = *mask1++;
 				if (win) m = ~m;
 				int llx1 = llx >= 128 ? 128 : llx;
-				for (int x = cur_x; x < llx1; x++) {
-					if ((*srct == tpri || (fl & DRAW_OPAQUE)) && !(m & (0x8000 >> (x >> 3)))) {
-						*dst = m_pens[*src & 0x1fff];
-						if (crd) *crd = uint32_t(l) << 18 | uint32_t(src - pix[l].data());
+				// Window masks cover eight pixels each. Skip whole masked or
+				// transparent groups before the per-pixel palette lookups.
+				for (int x = cur_x; x < llx1;) {
+					const int n = std::min(llx1 - x, 8 - (x & 7));
+					bool any = !(m & (0x8000 >> (x >> 3)));
+					if (any && !(fl & DRAW_OPAQUE) && n == 8) {
+						uint32_t a, b;
+						std::memcpy(&a, srct, 4); std::memcpy(&b, srct + 4, 4);
+						const uint32_t want = uint32_t(tpri) * 0x01010101u;
+						a ^= want; b ^= want;
+						any = (((a - 0x01010101u) & ~a) | ((b - 0x01010101u) & ~b)) & 0x80808080u;
 					}
-					src++; srct++; dst++;
-					if (crd) crd++;
+					if (any) for (int i = 0; i < n; i++) {
+						if (srct[i] == tpri || (fl & DRAW_OPAQUE)) {
+							dst[i] = m_pens[src[i] & 0x1fff];
+							if (crd) crd[i] = uint32_t(l) << 18 | uint32_t(src + i - pix[l].data());
+						}
+					}
+					src += n; srct += n; dst += n; x += n;
+					if (crd) crd += n;
 				}
 				llx -= 128;
 				cur_x = 0;

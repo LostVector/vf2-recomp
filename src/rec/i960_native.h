@@ -14,4 +14,15 @@ struct native_stats { size_t functions = 0, instructions = 0, native = 0, code_b
 // program into native code and installs it in rt. False on failure (the interpreter runs it all).
 bool build_native(runtime &rt, uint32_t (*rd)(void *, uint32_t), void *ctx, uint32_t limit, const hints &map, native_stats *stats = nullptr);
 
+// Complete 23-cycle rounds of the recognized timer poll. Leave the
+// potentially exiting iteration and partial slices to the normal execution.
+inline constexpr uint32_t timer_poll_mask=0xfffff;
+inline constexpr uint32_t timer_poll_elapsed(uint32_t counter,uint32_t limit,int budget){
+    constexpr unsigned cost=23;
+    if(budget<=int(cost)||counter>=timer_poll_mask||counter<=limit)return 0;
+    const unsigned by_budget=unsigned(budget-1)/cost;
+    const unsigned before_exit=(counter-limit-1)/cost;
+    return (by_budget<before_exit?by_budget:before_exit)*cost;
+}
+
 } // namespace i960rec

@@ -95,14 +95,31 @@
 *********************************************************************************************************************************/
 
 #include "model2_video.h"
+#include "state_io.h"
 #include "parallel.h"
 #include "texdump.h"
 #include "../gpu/gpu3d.h"
+#include "../gpu/geometry_frame.h"
+#include "../gpu/mesh_geometry.h"
 
+#include "geometry_math.h"
 #include <bit>
 #include <chrono>
 #include <cmath>
 #include <limits>
+
+struct model2_video::raw_polygon {
+    gpu3d_camera_poly packet;
+    uint16_t palette_index=0;
+    int16_t hue=-1;
+    uint8_t build=0;
+    int16_t viewport[4]{};
+};
+
+void model2_video::expand_camera(const compact_raw_polygon &r,gpu3d_camera_poly &p)
+{
+    gpu3d_geometry_frame::expand_compact(r,p);
+}
 
 #define pz      p[0]
 #define pu      p[1]
@@ -207,6 +224,7 @@ inline u16 model2_video::float_to_zval(float floatval, s32 z_adjust)
 
 static int32_t clip_polygon(poly_vertex *v, int32_t num_vertices, poly_vertex *vout, model2_video::plane clip_plane)
 {
+	if (!num_vertices) return 0;
 	int32_t outcount = 0;
 
 	const poly_vertex *cur = v;
@@ -217,7 +235,7 @@ static int32_t clip_polygon(poly_vertex *v, int32_t num_vertices, poly_vertex *v
 
 	for (int32_t i = 0; i < num_vertices; i++)
 	{
-		const int32_t nextvert = (i + 1) % num_vertices;
+		const int32_t nextvert = i + 1 == num_vertices ? 0 : i + 1;
 
 		/* if the current point is inside the plane, add it */
 		if (curin)
@@ -329,6 +347,22 @@ inline bool model2_video::check_culling(raster_state *raster, u32 attr, float mi
  *
  *******************************************/
 
+struct model2_video::geometry_job_state {
+    gpu3d_geometry_job list;
+    background_job worker;
+    std::function<void()> before_execution;
+    bool pending=false;
+    uint64_t jobs=0,copy_ns=0,execute_ns=0,wait_ns=0;
+};
+
+struct model2_video::mesh_capture {
+    vf2_mesh::catalog catalog;
+    std::vector<gpu3d_mesh_object> objects;
+    std::vector<gpu3d_mesh_polygon> polygons;
+    const vf2_mesh::geometry *active=nullptr;
+    uint32_t object=0,ordinal=0;
+};
+
 model2_video::model2_video(u32 *bufferram, u32 *textureram0, u32 *textureram1, u8 *lumaram, u16 *palram,
 						   u16 *colorxlat, u8 *gamma, const u8 *texture_rom, size_t texture_rom_bytes,
 						   const u8 *polygon_rom, size_t polygon_rom_bytes)
@@ -350,10 +384,11 @@ model2_video::model2_video(u32 *bufferram, u32 *textureram0, u32 *textureram1, u
 	m_geo->polygon_rom_mask = (polygon_rom_bytes / 4) - 1;
 }
 
-model2_video::~model2_video() = default;
+model2_video::~model2_video() { geometry_wait(); }
 
 void model2_video::model2_3d_zclip_w(u32 data)
 {
+    geometry_wait();
 	// setting this register to 0xff disables z-clip
 	m_raster->master_z_clip = data;
 }
@@ -361,6 +396,29 @@ void model2_video::model2_3d_zclip_w(u32 data)
 // TODO: only Sky Target seems to use this for unknown purpose
 u32 model2_video::polygon_count_r()
 {
+    geometry_wait();
+	if(m_camera_packets){
+		uint32_t count=0;
+		if(m_compact_camera){
+            const auto &picture=m_pictures[m_camera_live<0?0:m_camera_live];
+            const auto *records=m_shared_camera?
+                (m_camera_live<0?m_shared_camera_pending.get():picture.shared_compact_camera.get()):nullptr;
+            gpu3d_camera_poly packet;
+            if(records){
+                for(const auto &p:records->polygons){
+                    gpu3d_geometry_frame::expand_compact(p,records->contexts[p.context],packet);
+                    if(gpu3d_geometry_frame::visible(packet)&&++count==MAX_POLYGONS-1)break;
+                }
+            }else{
+                const auto &list=m_camera_live<0?m_compact_camera_pending:picture.compact_camera;
+                for(const auto &p:list){expand_camera(p,packet);if(gpu3d_geometry_frame::visible(packet)&&++count==MAX_POLYGONS-1)break;}
+            }
+        }else{
+            const auto &list=m_camera_live<0?m_camera_pending:m_pictures[m_camera_live].camera;
+            for(const auto &p:list)if(gpu3d_geometry_frame::visible(p.packet)&&++count==MAX_POLYGONS-1)break;
+        }
+		m_raster->poly_list_index=count;
+	}
 	m_polygon_count_reads++;
 	m_polygon_count_sum = (m_polygon_count_sum ^ m_raster->poly_list_index) * 0x100000001b3ull;   // (tests: what the game read)
 	return m_raster->poly_list_index;
@@ -368,6 +426,7 @@ u32 model2_video::polygon_count_r()
 
 void model2_video::get_regs(int16_t &xoffset, int16_t &yoffset, u8 &zclip) const
 {
+    const_cast<model2_video*>(this)->geometry_wait();
 	xoffset = m_crtc_xoffset;
 	yoffset = m_crtc_yoffset;
 	zclip = m_raster->master_z_clip;
@@ -375,6 +434,7 @@ void model2_video::get_regs(int16_t &xoffset, int16_t &yoffset, u8 &zclip) const
 
 void model2_video::set_regs(int16_t xoffset, int16_t yoffset, u8 zclip)
 {
+    geometry_wait();
 	m_crtc_xoffset = xoffset;
 	m_crtc_yoffset = yoffset;
 	m_renderer->set_xoffset(xoffset);
@@ -384,6 +444,7 @@ void model2_video::set_regs(int16_t xoffset, int16_t yoffset, u8 zclip)
 
 void model2_video::power_on()
 {
+    geometry_wait();
 	u16 *const texture_rom = m_raster->texture_rom;
 	const u32 texture_mask = m_raster->texture_rom_mask;
 	u32 *const polygon_rom = m_geo->polygon_rom;
@@ -396,12 +457,17 @@ void model2_video::power_on()
 	m_geo->raster = m_raster.get();
 	m_geo->polygon_rom = polygon_rom;
 	m_geo->polygon_rom_mask = polygon_mask;
+	m_direct_geometry_polygons=0;
 	m_geo_read_start_address = 0;
 	set_regs(0, 0, 0);
 	m_render_done = false;
 	m_render_test_mode = false;
 	std::fill(std::begin(m_shown), std::end(m_shown), -1);
-	for (int p = 0; p < 4; p++) m_pictures[p].deferred = false;
+	for (int p = 0; p < 4; p++) { m_pictures[p].deferred = false; m_pictures[p].camera.clear();m_pictures[p].compact_camera.clear();m_pictures[p].shared_compact_camera.reset();m_pictures[p].mesh_polygons.clear();m_pictures[p].mesh_objects.clear(); }
+	m_camera_pending.clear();m_compact_camera_pending.clear();
+    if(m_shared_camera_pending)m_shared_camera_pending->clear();
+    m_camera_context_index=UINT32_MAX;m_shared_camera_spare.reset();m_camera_live=-1;
+    if(m_mesh_capture){m_mesh_capture->active=nullptr;m_mesh_capture->objects.clear();m_mesh_capture->polygons.clear();}
 	m_deferred = false;
 	smooth_reset();
 	m_geo_keeps.clear();
@@ -420,8 +486,43 @@ struct model2_video::geo_keep
 	u8 log_ram[0x8000];
 };
 
+template<class IO> void model2_video::geometry_state(IO &io)
+{
+	auto &g=*m_geo;auto &r=*m_raster;
+	io.pod(g.mode);io.bytes(g.matrix,sizeof g.matrix);
+	io.bytes(&g.focus,sizeof g.focus);io.bytes(&g.light,sizeof g.light);io.bytes(&g.lod,sizeof g.lod);
+	io.bytes(g.coef_table,sizeof g.coef_table);io.bytes(g.texture_parameters,sizeof g.texture_parameters);
+	io.pod(g.polygon_ram0);io.pod(g.polygon_ram1);
+	io.pod(r.viewport);io.pod(r.widened);io.pod(r.center);io.pod(r.center_sel);
+	io.pod(r.reverse);io.pod(r.z_adjust);io.bytes(&r.polygon_z,sizeof r.polygon_z);
+	io.pod(r.cur_command);io.pod(r.command_buffer);io.pod(r.command_index);io.pod(r.cur_window);
+	io.bytes(r.clip_plane,sizeof r.clip_plane);io.pod(r.texture_ram);io.pod(r.log_ram);io.pod(r.master_z_clip);
+	if constexpr(IO::loading){
+		io.check(r.center_sel<4&&r.command_index<=32);
+		for(float value:g.matrix)io.check(std::isfinite(value));
+		io.check(std::isfinite(g.lod)&&std::isfinite(r.polygon_z));
+	}
+}
+
+void model2_video::save_geometry(std::vector<uint8_t> &out)
+{
+    geometry_wait();
+	m2::StateWriter writer(out);uint32_t version=1;writer.pod(version);geometry_state(writer);
+}
+
+bool model2_video::load_geometry(const uint8_t *data,size_t size)
+{
+    geometry_wait();
+	m2::StateReader reader(data,size);uint32_t version=0;reader.pod(version);
+	if(!reader.check(version==1))return false;
+	geometry_state(reader);
+	m_camera_context_index=UINT32_MAX;
+	return reader.done();
+}
+
 void model2_video::keep_geo(uint64_t key)
 {
+    geometry_wait();
 	constexpr size_t KEEPS = 40;   // (more saves than a rollback goes back over: the session saves each frame, 15 frames back at the most)
 	if (m_geo_keeps.size() < KEEPS) m_geo_keeps.push_back(std::make_unique<geo_keep>());
 	geo_keep &k = *m_geo_keeps[m_geo_keep_next++ % m_geo_keeps.size()];
@@ -445,6 +546,7 @@ void model2_video::keep_geo(uint64_t key)
 
 bool model2_video::restore_geo(uint64_t key)
 {
+    geometry_wait();
 	for (const auto &p : m_geo_keeps) {
 		if (p->key != key) continue;
 		const geo_keep &k = *p;
@@ -463,6 +565,7 @@ bool model2_video::restore_geo(uint64_t key)
 		for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) ra.clip_plane[i][j] = k.clip_plane[i][j];
 		memcpy(ra.texture_ram, k.texture_ram, sizeof k.texture_ram);
 		memcpy(ra.log_ram, k.log_ram, sizeof k.log_ram);
+		m_camera_context_index=UINT32_MAX;
 		return true;
 	}
 	return false;
@@ -472,6 +575,7 @@ bool model2_video::restore_geo(uint64_t key)
 // (at the end of vblank, every frame), for composite() to put on the screen.
 void model2_video::frame_end(bool render_test_mode, u64 frame_number)
 {
+    geometry_wait();
 	m_frame_number = frame_number;
 	m_render_test_mode = render_test_mode;
 	if (render_test_mode)
@@ -569,6 +673,7 @@ void model2_video::set_delay(int frames, bool cut)
 
 void model2_video::set_scale(int scale)
 {
+    geometry_wait();
 	scale = std::clamp(scale, 1, 8);
 	if (scale == m_scale) return;
 	m_scale = scale;
@@ -586,6 +691,7 @@ void model2_video::set_scale(int scale)
 
 void model2_video::set_ext(int ext)
 {
+    geometry_wait();
 	ext = std::clamp(ext, 0, 1408);   // (80:9: 1,405)
 	if (ext == m_ext) return;
 	m_ext = ext;
@@ -601,6 +707,7 @@ void model2_video::set_ext(int ext)
 
 void model2_video::defer_drawing(bool on)
 {
+    geometry_wait();
 	m_defer = on;
 	if (!on) draw_deferred();
 }
@@ -641,6 +748,8 @@ void model2_video::draw_picture(int picture)
 template <unsigned NumVerts>
 void model2_video::model2_3d_process_polygon(raster_state *raster, u32 attr)
 {
+    auto *mesh=m_mesh_capture.get();
+    const uint32_t ordinal=mesh&&mesh->active?mesh->ordinal++:0;
 	quad_m2 object;
 	// (the texture points and header: read through tpr and thr below)
 	int32_t tho;
@@ -692,54 +801,35 @@ void model2_video::model2_3d_process_polygon(raster_state *raster, u32 attr)
 	if (object.v[2].pz > max_z) max_z = object.v[2].pz;
 	if (NumVerts == 4 && object.v[3].pz > max_z) max_z = object.v[3].pz;
 
-	/* read in the texture information */
-
-	/* texture point data (each word's address kept to the memory, as the first's: points at its end, a display list
-	   from a snapshot's RAM, read past it) */
-	const u32 tpa = raster->command_buffer[0];
-	auto tpr = [&](u32 k) -> u16 { return tpa & 0x800000 ? raster->texture_ram[(tpa + k) & 0xffff] : raster->texture_rom[(tpa + k) & raster->texture_rom_mask]; };
-	object.v[0].pv = tpr(0);
-	object.v[0].pu = tpr(1);
-	object.v[1].pv = tpr(2);
-	object.v[1].pu = tpr(3);
-	object.v[2].pv = tpr(4);
-	object.v[2].pu = tpr(5);
-	if (NumVerts == 4)
-	{
-		object.v[3].pv = tpr(6);
-		object.v[3].pu = tpr(7);
-	}
-
-	/* update the address */
+	cull = check_culling(raster, attr, min_z, max_z) || raster->build_tint == 1;
+	const u32 tpa = raster->command_buffer[0], tha = raster->command_buffer[1];
 	raster->command_buffer[0] += NumVerts * 2;
-
-	/* texture header data (as the points') */
-	const u32 tha = raster->command_buffer[1];
-	auto thr = [&](u32 k) -> u16 { return tha & 0x800000 ? raster->texture_ram[(tha + k) & 0xffff] : raster->texture_rom[(tha + k) & raster->texture_rom_mask]; };
-	object.texheader[0] = thr(0);
-	object.texheader[1] = thr(1);
-	object.texheader[2] = thr(2);
-	object.texheader[3] = thr(3);
-
-	/* extract the texture header offset */
 	tho = (attr >> 12) & 0x1f;
-
-	/* adjust for sign */
-	if (tho & 0x10)
-		tho |= -16;
-
-	/* update the address */
+	if (tho & 0x10) tho |= -16;
 	raster->command_buffer[1] += tho * 4;
 
-	/* set the luma value of this polygon */
-	object.luma = (raster->command_buffer[9] >> 15) & 0xff;
-
-	/* set the texture LOD of this polygon */
-	object.texlod = ((raster->command_buffer[10] >> 8) & 0x7f80) - 0x3f80;
-	object.texlod += raster->log_ram[raster->command_buffer[10] & 0x7fff];
-
-	/* determine whether we can cull this polygon */
-	cull = check_culling(raster,attr,min_z,max_z) || raster->build_tint == 1;   // (the build's: not on yet)
+	static const bool early_material = std::getenv("VF2_EARLY_MATERIAL") != nullptr;
+	if (!cull || !early_material || !m_camera_packets)
+	{
+		// Culled polygons still advance both texture addresses and the depth
+		// and linking registers below; their unused material is never fetched.
+		auto tpr = [&](u32 k) -> u16 {
+			return tpa & 0x800000 ? raster->texture_ram[(tpa + k) & 0xffff]
+				: raster->texture_rom[(tpa + k) & raster->texture_rom_mask];
+		};
+		object.v[0].pv = tpr(0); object.v[0].pu = tpr(1);
+		object.v[1].pv = tpr(2); object.v[1].pu = tpr(3);
+		object.v[2].pv = tpr(4); object.v[2].pu = tpr(5);
+		if (NumVerts == 4) { object.v[3].pv = tpr(6); object.v[3].pu = tpr(7); }
+		auto thr = [&](u32 k) -> u16 {
+			return tha & 0x800000 ? raster->texture_ram[(tha + k) & 0xffff]
+				: raster->texture_rom[(tha + k) & raster->texture_rom_mask];
+		};
+		for (unsigned k = 0; k < 4; ++k) object.texheader[k] = thr(k);
+		object.luma = (raster->command_buffer[9] >> 15) & 0xff;
+		object.texlod = ((raster->command_buffer[10] >> 8) & 0x7f80) - 0x3f80;
+		object.texlod += raster->log_ram[raster->command_buffer[10] & 0x7fff];
+	}
 
 	/* set the object's z value */
 	switch ((attr >> 10) & 3)
@@ -761,10 +851,76 @@ void model2_video::model2_3d_process_polygon(raster_state *raster, u32 attr)
 
 	raster->polygon_z = zvalue;
 
-	if (cull == false)
+	if (!cull && m_camera_packets && raster == m_raster.get()) {
+		if(m_compact_camera){
+            if(mesh){
+                auto &record=mesh->polygons.emplace_back();
+                if(mesh->active&&ordinal<mesh->active->polygons.size()){
+                    const auto &source=mesh->active->polygons[ordinal];
+                    if(source.n==NumVerts&&(source.attributes&0x3ffff)==(attr&0x3ffff)){
+                        record={mesh->object,ordinal,source.position};
+                    }
+                }
+            }
+            auto capture_context=[&](gpu3d_camera_context &context){
+                const auto &planes=raster->clip_plane[raster->center_sel];
+                for(unsigned j=0;j<4;++j){
+                    const auto &plane=planes[j];
+                    context.planes[j][0]=plane.normal.x;
+                    context.planes[j][1]=plane.normal.y;
+                    context.planes[j][2]=plane.normal.pz;
+                    context.planes[j][3]=plane.distance;
+                }
+                context.center[0]=raster->center[raster->center_sel][0];
+                context.center[1]=raster->center[raster->center_sel][1];
+                std::copy(std::begin(raster->viewport),std::end(raster->viewport),context.viewport);
+            };
+            gpu3d_camera_attributes *record;
+            if(m_shared_camera){
+                auto &list=*m_shared_camera_pending;
+                if(m_camera_context_index==UINT32_MAX||m_camera_context_center!=raster->center_sel){
+                    m_camera_context_index=uint32_t(list.contexts.size());
+                    m_camera_context_center=raster->center_sel;
+                    capture_context(list.contexts.emplace_back());
+                }
+                auto &r=list.polygons.emplace_back();
+                r.context=m_camera_context_index;
+                record=&r;
+            }else{
+                auto &r=m_compact_camera_pending.emplace_back();
+                capture_context(r);
+                record=&r;
+            }
+            auto &r=*record;r.n=NumVerts;r.luma=object.luma;r.texlod=object.texlod;
+            for(unsigned j=0;j<NumVerts;++j){r.position[j][0]=object.v[j].x;r.position[j][1]=object.v[j].y;r.position[j][2]=object.v[j].pz;r.uv[j][0]=uint16_t(object.v[j].pu);r.uv[j][1]=uint16_t(object.v[j].pv);}
+            std::copy_n(object.texheader,4,r.header);
+            r.depth=float_to_zval(zvalue,raster->z_adjust);r.window=raster->cur_window;
+            r.palette_index=((object.texheader[3]>>6)&1023)+0x1000;r.hue=raster->hue;r.build=raster->build_tint;
+        }else{
+		auto &raw=m_camera_pending.emplace_back();auto &p=raw.packet;auto &g=p.material;
+		g.n=NumVerts;g.renderer=(object.texheader[0]>>13)&3;g.checker=(object.texheader[0]>>15)&1;
+		for(unsigned j=0;j<NumVerts;++j){g.x[j]=object.v[j].x;g.y[j]=object.v[j].y;g.z[j]=object.v[j].pz;g.u[j]=object.v[j].pu;g.v[j]=object.v[j].pv;}
+		for(int j=0;j<4;++j){const auto &c=raster->clip_plane[raster->center_sel][j];p.planes[j][0]=c.normal.x;p.planes[j][1]=c.normal.y;p.planes[j][2]=c.normal.pz;p.planes[j][3]=c.distance;}
+		p.center[0]=raster->center[raster->center_sel][0];p.center[1]=raster->center[raster->center_sel][1];
+		p.depth=float_to_zval(zvalue,raster->z_adjust);p.window=raster->cur_window;
+		// CRTC offsets are applied when the picture is presented, as in build_drawn.
+		std::copy(std::begin(raster->viewport),std::end(raster->viewport),raw.viewport);
+		g.lumabase=(object.texheader[1]&255)<<7;g.luma=object.luma;g.texlod=object.texlod;
+		g.sheet=(object.texheader[2]&0x1000)!=0;
+		g.texw=32<<((object.texheader[0]>>0)&7);g.texh=32<<((object.texheader[0]>>3)&7);
+		g.texx=32*((object.texheader[2]>>0)&63);g.texy=32*((object.texheader[2]>>6)&31);
+		g.mirrorx=(object.texheader[0]>>8)&1;g.mirrory=(object.texheader[0]>>9)&1;
+		g.wrapx=(object.texheader[0]>>6)&1&~g.mirrorx;g.wrapy=(object.texheader[0]>>7)&1&~g.mirrory;
+		g.utex=(object.texheader[0]>>12)&1;g.utexminlod=(object.texheader[0]>>10)&3;
+		g.utexx=((object.texheader[2]>>13)&1)*128;g.utexy=((object.texheader[2]>>14)&3)*128;
+		raw.palette_index=((object.texheader[3]>>6)&1023)+0x1000;raw.hue=raster->hue;raw.build=raster->build_tint;
+		}
+	}
+	else if (cull == false)
 	{
 		int32_t clipped_verts;
-		poly_vertex verts_in[8], verts_out[8];
+		poly_vertex clip_a[8], clip_b[8];
+		poly_vertex *verts_in = clip_a, *verts_out = clip_b;
 
 		for (int i = 0; i < NumVerts; i++)
 			verts_in[i] = object.v[i];
@@ -778,8 +934,7 @@ void model2_video::model2_3d_process_polygon(raster_state *raster, u32 attr)
 			near_plane.normal.pz = 1.0f;
 			near_plane.distance = raster->fc_near;
 			clipped_verts = clip_polygon(verts_in, clipped_verts, verts_out, near_plane);
-			for (int j = 0; j < clipped_verts; j++)
-				verts_in[j] = verts_out[j];
+			std::swap(verts_in, verts_out);
 			if (clipped_verts > 2 && ((attr >> 10) & 3) != 0 && ((attr >> 10) & 3) != 3) {
 				float lo = verts_in[0].pz, hi = verts_in[0].pz;
 				for (int j = 1; j < clipped_verts; j++) { lo = std::min(lo, verts_in[j].pz); hi = std::max(hi, verts_in[j].pz); }
@@ -791,9 +946,10 @@ void model2_video::model2_3d_process_polygon(raster_state *raster, u32 attr)
 		for (int i = 0; i < 4; i++)
 		{
 			clipped_verts = clip_polygon(verts_in, clipped_verts, verts_out, raster->clip_plane[raster->center_sel][i]);
-			for (int j = 0; j < clipped_verts; j++)
-				verts_in[j] = verts_out[j];
+			std::swap(verts_in, verts_out);
 		}
+		// The final polygon is in the input of the next clipping pass.
+		verts_out = verts_in;
 
 		if (clipped_verts > 2 && raster->poly_list_index < MAX_POLYGONS - 1)   // (a full list: the polygon left out, not the process stopped (MAME's fatal error), as a display list from a snapshot's RAM can fill it)
 		{
@@ -1080,6 +1236,76 @@ void model2_video::export_picture(int picture, std::vector<gpu3d_poly> &out) con
 	export_list(m_pictures[picture].drawn, out);
 }
 
+bool model2_video::camera_packets(bool on)
+{
+    geometry_wait();
+    static_assert(sizeof(compact_raw_polygon)<sizeof(raw_polygon));
+    if(on&&(!m_defer||m_smooth||m_fc_on||m_ext||m_delay))return false;
+    m_camera_packets=on;m_compact_camera=on&&std::getenv("VF2_COMPACT_CAMERA");
+    if(m_compact_camera&&(std::getenv("VF2_MESH_HANDOFF")||std::getenv("VF2_MESH_RENDER"))){
+        if(!m_mesh_capture)m_mesh_capture=std::make_unique<mesh_capture>();
+    }else m_mesh_capture.reset();
+    m_shared_camera=m_compact_camera&&!m_mesh_capture&&std::getenv("VF2_SHARED_CAMERA");
+    if(m_shared_camera&&!m_shared_camera_pending)m_shared_camera_pending=std::make_unique<gpu3d_shared_camera_list>();
+    if(m_shared_camera)std::fprintf(stderr,"Shared camera context: %zu bytes per record plus %zu bytes per context\n",
+        sizeof(gpu3d_context_camera_poly),sizeof(gpu3d_camera_context));
+    if(m_compact_camera)std::fprintf(stderr,"Camera record: %zu compact / %zu original bytes\n",sizeof(compact_raw_polygon),sizeof(raw_polygon));
+    return true;
+}
+
+bool model2_video::capture_camera_picture(int picture,gpu3d_geometry_frame &out,
+        const gpu3d_rams *color_snapshot)const
+{
+    out.release_shared_compact();
+    if(!m_camera_packets||picture<0||picture>2)return false;
+    const auto &source=m_pictures[picture];
+    out.final_window=source.camera_window;
+    out.compact=m_compact_camera;
+    out.mesh_objects=source.mesh_objects;
+    out.mesh_polygons=source.mesh_polygons;
+    if(m_compact_camera){
+        if(source.shared_compact_camera){
+            out.polygons.clear();out.compact_polygons.clear();
+            out.retain_compact(source.shared_compact_camera,source.camera_xoffset,source.camera_yoffset,
+                m_palram,m_colorxlat,m_gamma_table,hair_colour,color_snapshot);
+            return true;
+        }
+        // Resolve mutable palette/CRTC state now; workers later read only
+        // this owned compact copy while the board advances the next frame.
+        out.polygons.clear();out.compact_polygons.assign(source.compact_camera.begin(),source.compact_camera.end());
+        for(auto &r:out.compact_polygons){
+            gpu3d_geometry_frame::resolve_compact(r,source.camera_xoffset,source.camera_yoffset,
+                m_palram,m_colorxlat,m_gamma_table,hair_colour);
+        }
+        return true;
+    }
+    out.compact_polygons.clear();
+    out.polygons.resize(source.camera.size());
+    for(size_t i=0;i<source.camera.size();++i){
+        const auto &r=source.camera[i];auto &p=out.polygons[i];p=r.packet;auto &g=p.material;
+        p.center[0]+=source.camera_xoffset;p.center[1]=(384-p.center[1])+source.camera_yoffset;
+        g.vp[0]=std::max(0,int(r.viewport[0])+source.camera_xoffset);g.vp[1]=std::min(495,int(r.viewport[2])+source.camera_xoffset);
+        g.vp[2]=std::max(0,384-int(r.viewport[3])+source.camera_yoffset);g.vp[3]=std::min(383,384-int(r.viewport[1])+source.camera_yoffset);
+        const u32 colour=m_palram[r.palette_index];u32 pal=0;
+        if(r.hue>=0&&g.lumabase==0&&(g.renderer&2)){
+            const u32 hair=hair_colour(u16(colour&0x7fff),r.hue);pal=u16(hair);
+            if(hair>>16)g.luma=u16(std::min<u32>(u32(g.luma)*(hair>>16)/16,0xffff));
+        }
+        if(r.build>=2){
+            const u32 v=r.build==2?255u:64u+(u32(r.packet.material.luma)*9>>4);
+            g.renderer=0;g.checker=0;g.colour=rgb_t(v,v,r.build==2?255u:std::min(v+6,255u));
+        }else if(g.renderer&2)g.pal=pal?pal&0x7fff:colour&0x7fff;
+        else {
+            const u32 c=pal?pal&0x7fff:colour&0xffff,l=g.luma>>2;
+            const u32 red=m_colorxlat[(((c>>0)&31)<<8)+l]&255;
+            const u32 green=m_colorxlat[0x2000+(((c>>5)&31)<<8)+l]&255;
+            const u32 blue=m_colorxlat[0x4000+(((c>>10)&31)<<8)+l]&255;
+            g.colour=rgb_t(m_gamma_table[red],m_gamma_table[green],m_gamma_table[blue]);
+        }
+    }
+    return true;
+}
+
 void model2_video::export_list(const std::vector<drawn_poly> &list, std::vector<gpu3d_poly> &out) const
 {
 	out.reserve(list.size());
@@ -1212,6 +1438,7 @@ void model2_video::gpu_rams(gpu3d_rams &out) const
 	out.tex[0] = m_textureram0; out.tex[1] = m_textureram1;
 	out.luma = m_lumaram; out.xlat = m_colorxlat; out.gamma = m_gamma_table;
 	out.gen[0] = m_ram_gen[GPU_TEX0]; out.gen[1] = m_ram_gen[GPU_TEX1]; out.gen[2] = m_ram_gen[GPU_LUMA]; out.gen[3] = m_ram_gen[GPU_XLAT]; out.gen[4] = 0;
+	out.tex_page_gen[0]=m_texture_page_gen[0];out.tex_page_gen[1]=m_texture_page_gen[1];
 }
 
 void model2_video::owner_map_shown(u32 *out, size_t stride)
@@ -1308,6 +1535,39 @@ void model2_video::render_polygons()
 	{
 		show(m_shown[2]);
 		return;
+	}
+	if(m_camera_packets){
+        const bool empty=m_shared_camera?m_shared_camera_pending->polygons.empty():
+            m_compact_camera?m_compact_camera_pending.empty():m_camera_pending.empty();
+        if(empty){show(-1);return;}
+		int pic=0;if(m_delay)while(pic==m_shown[1]||pic==m_shown[2])++pic;
+		auto &p=m_pictures[pic];
+        if(m_shared_camera){
+            auto &shown=p.shared_compact_camera;
+            if(!shown||!shown.unique()){
+                auto next=m_shared_camera_spare&&m_shared_camera_spare.unique()?std::move(m_shared_camera_spare):
+                    std::make_shared<gpu3d_shared_camera_list>();
+                m_shared_camera_spare=std::move(shown);
+                shown=std::move(next);
+            }
+            // Only the writer's unique buffer is ever modified. A reader can
+            // retain an older picture even when the board publishes a new one.
+            std::swap(*shown,*m_shared_camera_pending);
+            m_shared_camera_pending->clear();
+            m_camera_context_index=UINT32_MAX;
+        }else if(m_compact_camera){
+            p.shared_compact_camera.reset();
+            p.compact_camera.swap(m_compact_camera_pending);
+        }else p.camera.swap(m_camera_pending);
+        m_camera_live=pic;
+        if(m_mesh_capture){
+            p.mesh_objects.swap(m_mesh_capture->objects);
+            p.mesh_polygons.swap(m_mesh_capture->polygons);
+        }
+
+		p.camera_xoffset=m_crtc_xoffset;p.camera_yoffset=m_crtc_yoffset;p.camera_window=raster->cur_window;
+		p.drawn.clear();p.deferred=m_deferred=true;m_pic_frame[pic]=m_parsed_frame;
+		show(pic);m_render_done=true;return;
 	}
 
 	/* if we have nothing to render, bail */
@@ -1485,6 +1745,8 @@ void model2_video::model2_3d_push(raster_state *raster, u32 input)
 				if (raster->command_index < 6)
 					return;
 
+				if(raster==m_raster.get())m_camera_context_index=UINT32_MAX;
+
 				/* coordinates are 12 bit signed */
 
 				/* extract the viewport start x */
@@ -1639,6 +1901,30 @@ void model2_video::model2_3d_push(raster_state *raster, u32 input)
  *
  *******************************************/
 
+template<unsigned N>
+void model2_video::model2_3d_push_words(raster_state *raster,const u32 (&input)[N])
+{
+	static const bool reference=std::getenv("VF2_REFERENCE_GEOMETRY_PUSH")!=nullptr;
+	if(!reference&&raster->cur_command==1){
+		const unsigned index=raster->command_index;
+		if(index<=8&&N<=8-index){
+			std::copy_n(input,N,raster->command_buffer+index);raster->command_index=index+N;return;
+		}
+		const u32 attr=raster->command_buffer[8];
+		const unsigned finish=(attr&1)?17:14;
+		if((attr&3)&&index>=9&&index<=finish&&N<=finish-index){
+			std::copy_n(input,N,raster->command_buffer+index);raster->command_index=index+N;
+			if(index+N==finish){
+				if(attr&1)model2_3d_process_polygon<4>(raster,attr);
+				else model2_3d_process_polygon<3>(raster,attr);
+				raster->command_index=8;
+			}
+			return;
+		}
+	}
+	for(u32 word:input)model2_3d_push(raster,word);
+}
+
 /* Parse Polygons: Normals Present, No Specular case */
 // The geometrizer's reads of a display list's words, and of an object's in polygon RAM or ROM: none past the end of the
 // memory they're in (m_geo_end), whatever counts and addresses the list holds (a snapshot's RAM can hold anything; MAME's
@@ -1649,6 +1935,7 @@ void model2_video::model2_3d_push(raster_state *raster, u32 input)
 
 void model2_video::geo_parse_np_ns(geo_state *geo, u32 *input, u32 count)
 {
+	const geometry_math::matrix3x4 transform(geo->matrix);
 	raster_state *raster = geo->raster;
 	poly_vertex point, normal;
 	u32  attr, i;
@@ -1659,15 +1946,13 @@ void model2_video::geo_parse_np_ns(geo_state *geo, u32 *input, u32 count)
 	point.pz = u2f(GEO_NEXT(input));
 
 	/* transform with the current matrix */
-	transform_point(&point, geo->matrix);
+	transform.apply(point.x,point.y,point.pz,true);
 
 	/* apply focus */
 	apply_focus(geo, &point);
 
 	/* push it to the 3d rasterizer */
-	model2_3d_push(raster, f2u(point.x) >> 8);
-	model2_3d_push(raster, f2u(point.y) >> 8);
-	model2_3d_push(raster, f2u(point.pz) >> 8);
+	model2_3d_push_words(raster, {f2u(point.x) >> 8, f2u(point.y) >> 8, f2u(point.pz) >> 8});
 
 	/* read the 2nd point */
 	point.x = u2f(GEO_NEXT(input));
@@ -1675,15 +1960,13 @@ void model2_video::geo_parse_np_ns(geo_state *geo, u32 *input, u32 count)
 	point.pz = u2f(GEO_NEXT(input));
 
 	/* transform with the current matrix */
-	transform_point(&point, geo->matrix);
+	transform.apply(point.x,point.y,point.pz,true);
 
 	/* apply focus */
 	apply_focus(geo, &point);
 
 	/* push it to the 3d rasterizer */
-	model2_3d_push(raster, f2u(point.x) >> 8);
-	model2_3d_push(raster, f2u(point.y) >> 8);
-	model2_3d_push(raster, f2u(point.pz) >> 8);
+	model2_3d_push_words(raster, {f2u(point.x) >> 8, f2u(point.y) >> 8, f2u(point.pz) >> 8});
 
 	/* loop through the following links */
 	for (i = 0; i < count && input < m_geo_end; i++)
@@ -1701,7 +1984,7 @@ void model2_video::geo_parse_np_ns(geo_state *geo, u32 *input, u32 count)
 		normal.pz = u2f(GEO_NEXT(input));
 
 		/* transform with the current matrix */
-		transform_vector(&normal, geo->matrix);
+		transform.apply(normal.x,normal.y,normal.pz,false);
 
 		if ((attr & 3) != 0) /* quad or triangle */
 		{
@@ -1716,7 +1999,7 @@ void model2_video::geo_parse_np_ns(geo_state *geo, u32 *input, u32 count)
 			point.pz = u2f(GEO_NEXT(input));
 
 			/* transform with the current matrix */
-			transform_point(&point, geo->matrix);
+			transform.apply(point.x,point.y,point.pz,true);
 
 			/* calculate the dot product of the normal and the light vector */
 			dotl = dot_product(normal, geo->light);
@@ -1753,11 +2036,7 @@ void model2_video::geo_parse_np_ns(geo_state *geo, u32 *input, u32 count)
 			distance = coef * fabs(dotp) * geo->lod;
 
 			/* push to the 3d rasterizer */
-			model2_3d_push(raster, luma << 15);
-			model2_3d_push(raster, f2u(distance) >> 8);
-			model2_3d_push(raster, f2u(point.x) >> 8);
-			model2_3d_push(raster, f2u(point.y) >> 8);
-			model2_3d_push(raster, f2u(point.pz) >> 8);
+			model2_3d_push_words(raster, {u32(luma) << 15, f2u(distance) >> 8, f2u(point.x) >> 8, f2u(point.y) >> 8, f2u(point.pz) >> 8});
 
 			/* if it's a quad, push one more point */
 			if (attr & 1)
@@ -1768,15 +2047,13 @@ void model2_video::geo_parse_np_ns(geo_state *geo, u32 *input, u32 count)
 				point.pz = u2f(GEO_NEXT(input));
 
 				/* transform with the current matrix */
-				transform_point(&point, geo->matrix);
+				transform.apply(point.x,point.y,point.pz,true);
 
 				/* apply focus */
 				apply_focus(geo, &point);
 
 				/* push to the 3d rasterizer */
-				model2_3d_push(raster, f2u(point.x) >> 8);
-				model2_3d_push(raster, f2u(point.y) >> 8);
-				model2_3d_push(raster, f2u(point.pz) >> 8);
+				model2_3d_push_words(raster, {f2u(point.x) >> 8, f2u(point.y) >> 8, f2u(point.pz) >> 8});
 			}
 			else /* triangle */
 			{
@@ -1795,9 +2072,29 @@ void model2_video::geo_parse_np_ns(geo_state *geo, u32 *input, u32 count)
 }
 
 /* Parse Polygons: Normals Present, Specular case */
-void model2_video::geo_parse_np_s(geo_state *geo, u32 *input, u32 count)
+void model2_video::geo_parse_np_s(geo_state *geo,u32 *input,u32 count)
 {
+    static const bool direct=std::getenv("VF2_DIRECT_GEOMETRY")!=nullptr && std::getenv("VF2_REFERENCE_GEOMETRY_PUSH")==nullptr;
+    if(direct&&m_camera_packets&&geo->raster->cur_command==1&&geo->raster->command_index==2)
+        geo_parse_np_s_impl<true>(geo,input,count);
+    else geo_parse_np_s_impl<false>(geo,input,count);
+}
+
+template<bool Direct>
+void model2_video::geo_parse_np_s_impl(geo_state *geo, u32 *input, u32 count)
+{
+	const geometry_math::matrix3x4 transform(geo->matrix);
 	raster_state *raster = geo->raster;
+    // A complete object enters with the polygon command and texture addresses
+    // already installed. Preserve the hardware-visible words and precision, but
+    // submit each completed polygon without decoding command-port state again.
+    auto words = [&]<unsigned Offset, unsigned N>(const u32 (&data)[N]) {
+        if constexpr(Direct) {
+            std::copy_n(data,N,raster->command_buffer+Offset);
+            raster->command_index=Offset+N;
+        } else model2_3d_push_words(raster,data);
+    };
+
 	poly_vertex point, normal;
 	u32  attr, i;
 
@@ -1807,15 +2104,13 @@ void model2_video::geo_parse_np_s(geo_state *geo, u32 *input, u32 count)
 	point.pz = u2f(GEO_NEXT(input));
 
 	/* transform with the current matrix */
-	transform_point(&point, geo->matrix);
+	transform.apply(point.x,point.y,point.pz,true);
 
 	/* apply focus */
 	apply_focus(geo, &point);
 
 	/* push it to the 3d rasterizer */
-	model2_3d_push(raster, f2u(point.x) >> 8);
-	model2_3d_push(raster, f2u(point.y) >> 8);
-	model2_3d_push(raster, f2u(point.pz) >> 8);
+	words.template operator()<2>({f2u(point.x) >> 8, f2u(point.y) >> 8, f2u(point.pz) >> 8});
 
 	/* read the 2nd point */
 	point.x = u2f(GEO_NEXT(input));
@@ -1823,15 +2118,13 @@ void model2_video::geo_parse_np_s(geo_state *geo, u32 *input, u32 count)
 	point.pz = u2f(GEO_NEXT(input));
 
 	/* transform with the current matrix */
-	transform_point(&point, geo->matrix);
+	transform.apply(point.x,point.y,point.pz,true);
 
 	/* apply focus */
 	apply_focus(geo, &point);
 
 	/* push it to the 3d rasterizer */
-	model2_3d_push(raster, f2u(point.x) >> 8);
-	model2_3d_push(raster, f2u(point.y) >> 8);
-	model2_3d_push(raster, f2u(point.pz) >> 8);
+	words.template operator()<5>({f2u(point.x) >> 8, f2u(point.y) >> 8, f2u(point.pz) >> 8});
 
 	/* loop through the following links */
 	for (i = 0; i < count && input < m_geo_end; i++)
@@ -1841,7 +2134,11 @@ void model2_video::geo_parse_np_s(geo_state *geo, u32 *input, u32 count)
 		attr = GEO_NEXT(input);
 
 		/* push to the 3d rasterizer */
-		model2_3d_push(raster, attr & 0x0003ffff);
+		if constexpr(Direct) {
+            raster->command_buffer[8]=attr&0x0003ffff;
+            raster->command_index=9;
+            if(!(attr&3))raster->cur_command=0;
+        } else model2_3d_push(raster,attr&0x0003ffff);
 
 		/* read in the normal */
 		normal.x = u2f(GEO_NEXT(input));
@@ -1849,7 +2146,7 @@ void model2_video::geo_parse_np_s(geo_state *geo, u32 *input, u32 count)
 		normal.pz = u2f(GEO_NEXT(input));
 
 		/* transform with the current matrix */
-		transform_vector(&normal, geo->matrix);
+		transform.apply(normal.x,normal.y,normal.pz,false);
 
 		if ((attr & 3) != 0) /* quad or triangle */
 		{
@@ -1864,7 +2161,7 @@ void model2_video::geo_parse_np_s(geo_state *geo, u32 *input, u32 count)
 			point.pz = u2f(GEO_NEXT(input));
 
 			/* transform with the current matrix */
-			transform_point(&point, geo->matrix);
+			transform.apply(point.x,point.y,point.pz,true);
 
 			/* calculate the dot product of the normal and the light vector */
 			dotl = dot_product(normal, geo->light);
@@ -1910,11 +2207,7 @@ void model2_video::geo_parse_np_s(geo_state *geo, u32 *input, u32 count)
 			distance = coef * fabs(dotp) * geo->lod;
 
 			/* push to the 3d rasterizer */
-			model2_3d_push(raster, luma << 15);
-			model2_3d_push(raster, f2u(distance) >> 8);
-			model2_3d_push(raster, f2u(point.x) >> 8);
-			model2_3d_push(raster, f2u(point.y) >> 8);
-			model2_3d_push(raster, f2u(point.pz) >> 8);
+			words.template operator()<9>({u32(luma) << 15, f2u(distance) >> 8, f2u(point.x) >> 8, f2u(point.y) >> 8, f2u(point.pz) >> 8});
 
 			/* if it's a quad, push one more point */
 			if (attr & 1)
@@ -1925,21 +2218,25 @@ void model2_video::geo_parse_np_s(geo_state *geo, u32 *input, u32 count)
 				point.pz = u2f(GEO_NEXT(input));
 
 				/* transform with the current matrix */
-				transform_point(&point, geo->matrix);
+				transform.apply(point.x,point.y,point.pz,true);
 
 				/* apply focus */
 				apply_focus(geo, &point);
 
 				/* push to the 3d rasterizer */
-				model2_3d_push(raster, f2u(point.x) >> 8);
-				model2_3d_push(raster, f2u(point.y) >> 8);
-				model2_3d_push(raster, f2u(point.pz) >> 8);
+				words.template operator()<14>({f2u(point.x) >> 8, f2u(point.y) >> 8, f2u(point.pz) >> 8});
 			}
 			else /* triangle */
 			{
 				/* skip the next 3 points */
 				input = GEO_SKIP(input, 3);
 			}
+            if constexpr(Direct) {
+                if(attr&1)model2_3d_process_polygon<4>(raster,attr&0x3ffff);
+                else model2_3d_process_polygon<3>(raster,attr&0x3ffff);
+                raster->command_index=8;
+                ++m_direct_geometry_polygons;
+            }
 		}
 		else /* we're done */
 		{
@@ -1954,6 +2251,7 @@ void model2_video::geo_parse_np_s(geo_state *geo, u32 *input, u32 count)
 /* Parse Polygons: No Normals, No Specular case */
 void model2_video::geo_parse_nn_ns(geo_state *geo, u32 *input, u32 count)
 {
+	const geometry_math::matrix3x4 transform(geo->matrix);
 	raster_state *raster = geo->raster;
 	poly_vertex point, normal, p0, p1, p2, p3;
 	u32  attr, i;
@@ -1964,7 +2262,7 @@ void model2_video::geo_parse_nn_ns(geo_state *geo, u32 *input, u32 count)
 	point.pz = u2f(GEO_NEXT(input));
 
 	/* transform with the current matrix */
-	transform_point(&point, geo->matrix);
+	transform.apply(point.x,point.y,point.pz,true);
 
 	/* save for normal calculation */
 	p0.x = point.x; p0.y = point.y; p0.pz = point.pz;
@@ -1973,9 +2271,7 @@ void model2_video::geo_parse_nn_ns(geo_state *geo, u32 *input, u32 count)
 	apply_focus(geo, &point);
 
 	/* push it to the 3d rasterizer */
-	model2_3d_push(raster, f2u(point.x) >> 8);
-	model2_3d_push(raster, f2u(point.y) >> 8);
-	model2_3d_push(raster, f2u(point.pz) >> 8);
+	model2_3d_push_words(raster, {f2u(point.x) >> 8, f2u(point.y) >> 8, f2u(point.pz) >> 8});
 
 	/* read the 2nd point */
 	point.x = u2f(GEO_NEXT(input));
@@ -1983,7 +2279,7 @@ void model2_video::geo_parse_nn_ns(geo_state *geo, u32 *input, u32 count)
 	point.pz = u2f(GEO_NEXT(input));
 
 	/* transform with the current matrix */
-	transform_point(&point, geo->matrix);
+	transform.apply(point.x,point.y,point.pz,true);
 
 	/* save for normal calculation */
 	p1.x = point.x; p1.y = point.y; p1.pz = point.pz;
@@ -1992,9 +2288,7 @@ void model2_video::geo_parse_nn_ns(geo_state *geo, u32 *input, u32 count)
 	apply_focus(geo, &point);
 
 	/* push it to the 3d rasterizer */
-	model2_3d_push(raster, f2u(point.x) >> 8);
-	model2_3d_push(raster, f2u(point.y) >> 8);
-	model2_3d_push(raster, f2u(point.pz) >> 8);
+	model2_3d_push_words(raster, {f2u(point.x) >> 8, f2u(point.y) >> 8, f2u(point.pz) >> 8});
 
 	/* loop through the following links */
 	for (i = 0; i < count && input < m_geo_end; i++)
@@ -2022,7 +2316,7 @@ void model2_video::geo_parse_nn_ns(geo_state *geo, u32 *input, u32 count)
 			point.pz = u2f(GEO_NEXT(input));
 
 			/* transform with the current matrix */
-			transform_point(&point, geo->matrix);
+			transform.apply(point.x,point.y,point.pz,true);
 
 			/* save for normal calculation */
 			p2.x = point.x; p2.y = point.y; p2.pz = point.pz;
@@ -2068,11 +2362,7 @@ void model2_video::geo_parse_nn_ns(geo_state *geo, u32 *input, u32 count)
 			distance = coef * fabs(dotp) * geo->lod;
 
 			/* push to the 3d rasterizer */
-			model2_3d_push(raster, luma << 15);
-			model2_3d_push(raster, f2u(distance) >> 8);
-			model2_3d_push(raster, f2u(point.x) >> 8);
-			model2_3d_push(raster, f2u(point.y) >> 8);
-			model2_3d_push(raster, f2u(point.pz) >> 8);
+			model2_3d_push_words(raster, {u32(luma) << 15, f2u(distance) >> 8, f2u(point.x) >> 8, f2u(point.y) >> 8, f2u(point.pz) >> 8});
 
 			/* if it's a quad, push one more point */
 			if (attr & 1)
@@ -2083,7 +2373,7 @@ void model2_video::geo_parse_nn_ns(geo_state *geo, u32 *input, u32 count)
 				point.pz = u2f(GEO_NEXT(input));
 
 				/* transform with the current matrix */
-				transform_point(&point, geo->matrix);
+				transform.apply(point.x,point.y,point.pz,true);
 
 				/* save for normal calculation */
 				p3.x = point.x; p3.y = point.y; p3.pz = point.pz;
@@ -2092,9 +2382,7 @@ void model2_video::geo_parse_nn_ns(geo_state *geo, u32 *input, u32 count)
 				apply_focus(geo, &point);
 
 				/* push to the 3d rasterizer */
-				model2_3d_push(raster, f2u(point.x) >> 8);
-				model2_3d_push(raster, f2u(point.y) >> 8);
-				model2_3d_push(raster, f2u(point.pz) >> 8);
+				model2_3d_push_words(raster, {f2u(point.x) >> 8, f2u(point.y) >> 8, f2u(point.pz) >> 8});
 			}
 			else
 			{
@@ -2145,6 +2433,7 @@ void model2_video::geo_parse_nn_ns(geo_state *geo, u32 *input, u32 count)
 /* Parse Polygons: No Normals, Specular case */
 void model2_video::geo_parse_nn_s(geo_state *geo, u32 *input, u32 count)
 {
+	const geometry_math::matrix3x4 transform(geo->matrix);
 	raster_state *raster = geo->raster;
 	poly_vertex point, normal, p0, p1, p2, p3;
 	u32  attr, i;
@@ -2155,7 +2444,7 @@ void model2_video::geo_parse_nn_s(geo_state *geo, u32 *input, u32 count)
 	point.pz = u2f(GEO_NEXT(input));
 
 	/* transform with the current matrix */
-	transform_point(&point, geo->matrix);
+	transform.apply(point.x,point.y,point.pz,true);
 
 	/* save for normal calculation */
 	p0.x = point.x; p0.y = point.y; p0.pz = point.pz;
@@ -2164,9 +2453,7 @@ void model2_video::geo_parse_nn_s(geo_state *geo, u32 *input, u32 count)
 	apply_focus(geo, &point);
 
 	/* push it to the 3d rasterizer */
-	model2_3d_push(raster, f2u(point.x) >> 8);
-	model2_3d_push(raster, f2u(point.y) >> 8);
-	model2_3d_push(raster, f2u(point.pz) >> 8);
+	model2_3d_push_words(raster, {f2u(point.x) >> 8, f2u(point.y) >> 8, f2u(point.pz) >> 8});
 
 	/* read the 2nd point */
 	point.x = u2f(GEO_NEXT(input));
@@ -2174,7 +2461,7 @@ void model2_video::geo_parse_nn_s(geo_state *geo, u32 *input, u32 count)
 	point.pz = u2f(GEO_NEXT(input));
 
 	/* transform with the current matrix */
-	transform_point(&point, geo->matrix);
+	transform.apply(point.x,point.y,point.pz,true);
 
 	/* save for normal calculation */
 	p1.x = point.x; p1.y = point.y; p1.pz = point.pz;
@@ -2183,9 +2470,7 @@ void model2_video::geo_parse_nn_s(geo_state *geo, u32 *input, u32 count)
 	apply_focus(geo, &point);
 
 	/* push it to the 3d rasterizer */
-	model2_3d_push(raster, f2u(point.x) >> 8);
-	model2_3d_push(raster, f2u(point.y) >> 8);
-	model2_3d_push(raster, f2u(point.pz) >> 8);
+	model2_3d_push_words(raster, {f2u(point.x) >> 8, f2u(point.y) >> 8, f2u(point.pz) >> 8});
 
 	/* loop through the following links */
 	for (i = 0; i < count && input < m_geo_end; i++)
@@ -2213,7 +2498,7 @@ void model2_video::geo_parse_nn_s(geo_state *geo, u32 *input, u32 count)
 			point.pz = u2f(GEO_NEXT(input));
 
 			/* transform with the current matrix */
-			transform_point(&point, geo->matrix);
+			transform.apply(point.x,point.y,point.pz,true);
 
 			/* save for normal calculation */
 			p2.x = point.x; p2.y = point.y; p2.pz = point.pz;
@@ -2268,11 +2553,7 @@ void model2_video::geo_parse_nn_s(geo_state *geo, u32 *input, u32 count)
 			distance = coef * fabs(dotp) * geo->lod;
 
 			/* push to the 3d rasterizer */
-			model2_3d_push(raster, luma << 15);
-			model2_3d_push(raster, f2u(distance) >> 8);
-			model2_3d_push(raster, f2u(point.x) >> 8);
-			model2_3d_push(raster, f2u(point.y) >> 8);
-			model2_3d_push(raster, f2u(point.pz) >> 8);
+			model2_3d_push_words(raster, {u32(luma) << 15, f2u(distance) >> 8, f2u(point.x) >> 8, f2u(point.y) >> 8, f2u(point.pz) >> 8});
 
 			/* if it's a quad, push one more point */
 			if (attr & 1)
@@ -2283,7 +2564,7 @@ void model2_video::geo_parse_nn_s(geo_state *geo, u32 *input, u32 count)
 				point.pz = u2f(GEO_NEXT(input));
 
 				/* transform with the current matrix */
-				transform_point(&point, geo->matrix);
+				transform.apply(point.x,point.y,point.pz,true);
 
 				/* save for normal calculation */
 				p3.x = point.x; p3.y = point.y; p3.pz = point.pz;
@@ -2292,9 +2573,7 @@ void model2_video::geo_parse_nn_s(geo_state *geo, u32 *input, u32 count)
 				apply_focus(geo, &point);
 
 				/* push to the 3d rasterizer */
-				model2_3d_push(raster, f2u(point.x) >> 8);
-				model2_3d_push(raster, f2u(point.y) >> 8);
-				model2_3d_push(raster, f2u(point.pz) >> 8);
+				model2_3d_push_words(raster, {f2u(point.x) >> 8, f2u(point.y) >> 8, f2u(point.pz) >> 8});
 			}
 			else
 			{
@@ -2408,7 +2687,7 @@ u32 *model2_video::geo_object_data(geo_state *geo, u32 opcode, u32 *input)
 	// smooth motion: the object kept with its matrix, or drawn again with the blended one
 	float kept[12];
 	bool swapped = false;
-	if (m_rec) smooth_note_object(oba, geo->matrix);
+	if (m_rec) smooth_note_object(oba,obc,geo->mode,tpa,tha,geo->matrix,geo->focus.x,geo->focus.y);
 	else if (m_replay) {
 		const size_t i = m_replay_obj++;
 		if (i < m_blend_ok.size() && m_blend_ok[i]) {
@@ -2442,6 +2721,19 @@ u32 *model2_video::geo_object_data(geo_state *geo, u32 opcode, u32 *input)
 	// (the object's words read up to the end of the memory it's in, never past it)
 	u32 *const end_was = m_geo_end;
 	m_geo_end = oba & 0x01000000 ? geo->polygon_ram1 + 0x8000 : oba & 0x00800000 ? geo->polygon_rom + geo->polygon_rom_mask + 1 : geo->polygon_ram0 + 0x8000;
+    auto *mesh=m_mesh_capture.get();
+    if(mesh&&raster==m_raster.get()&&(oba&0x01800000)==0x00800000&&!fc&&!swapped){
+        const vf2_mesh::key key{oba,obc,geo->mode};
+        mesh->active=mesh->catalog.get(key,{obp,size_t(m_geo_end-obp)});
+        if(mesh->active){
+            mesh->ordinal=0;
+            mesh->object=uint32_t(mesh->objects.size());
+            auto &o=mesh->objects.emplace_back();
+            o.address=oba;o.count=obc;o.mode=geo->mode;
+            std::copy_n(geo->matrix,12,o.matrix.begin());
+            o.focus={geo->focus.x,geo->focus.y};
+        }
+    }
 	switch (geo->mode & 3)
 	{
 		/* Normals present, No Specular */
@@ -2456,6 +2748,7 @@ u32 *model2_video::geo_object_data(geo_state *geo, u32 opcode, u32 *input)
 		/* No Normals present, Specular */
 		case 3: geo_parse_nn_s(geo, obp, obc); break;
 	}
+    if(mesh)mesh->active=nullptr;
 	m_geo_end = end_was;
 	if (swapped) memcpy(geo->matrix, kept, sizeof kept);
 	if (fc) { geo->light = light_kept; raster->fc_near = 0; }
@@ -3040,19 +3333,91 @@ u32 *model2_video::geo_process_command(geo_state *geo, u32 opcode, u32 *input, b
 	return input;
 }
 
-void model2_video::geo_parse()
-{
-	if (m_smooth) smooth_record_start();
-	m_build_frame = m_geo_frame;
-	geo_run(m_bufferram, m_geo_read_start_address, m_geo.get(), m_raster.get());
-	m_render_done = false;
-	m_parsed_frame = m_geo_frame;
-	if (m_smooth) smooth_record_end();
+bool model2_video::geometry_job_compatible()const {
+    // Previous camera pictures own their packets; deferred colour-RAM handling
+    // can consume them while this job builds only the next pending list.
+    return m_camera_packets&&m_defer&&!m_smooth&&!m_fc_on&&
+        !m_ext&&!m_delay&&!m_rec&&!m_replay;
+}
+
+bool model2_video::geometry_jobs(geometry_execution mode){
+    geometry_wait();
+    if(mode!=geometry_execution::synchronous&&!geometry_job_compatible())return false;
+    if(mode!=geometry_execution::synchronous&&!m_geometry_job)m_geometry_job=std::make_unique<geometry_job_state>();
+    m_geometry_execution=mode;return true;
+}
+
+bool model2_video::observe_geometry_worker(std::function<void()> observer){
+    geometry_wait();
+    if(m_geometry_execution!=geometry_execution::worker||!m_geometry_job)return false;
+    m_geometry_job->before_execution=std::move(observer);
+    return true;
+}
+
+void model2_video::geometry_wait(){
+    if(!m_geometry_job||!m_geometry_job->pending)return;
+    const auto start=std::chrono::steady_clock::now();
+    if(m_geometry_execution==geometry_execution::deferred)execute_geometry_job();
+    else m_geometry_job->worker.wait();
+    m_geometry_job->pending=false;
+    m_geometry_job->wait_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count());
+}
+
+void model2_video::execute_geometry_job(){
+    const auto start=std::chrono::steady_clock::now();auto &job=*m_geometry_job;
+    std::fenv_t previous{};std::fegetenv(&previous);std::fesetenv(&job.list.environment);
+    geo_parse_list(job.list.commands.data(),job.list.start,job.list.frame);
+    std::fesetenv(&previous);
+    job.execute_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count());
+}
+
+void model2_video::reset_geometry_job_stats(){geometry_wait();if(m_geometry_job)m_geometry_job->jobs=m_geometry_job->copy_ns=m_geometry_job->execute_ns=m_geometry_job->wait_ns=0;}
+uint64_t model2_video::geometry_job_count(){geometry_wait();return m_geometry_job?m_geometry_job->jobs:0;}
+void model2_video::report_geometry_jobs(FILE *out){
+    geometry_wait();if(!m_geometry_job||!m_geometry_job->jobs)return;const auto &j=*m_geometry_job;const double scale=1e-6/double(j.jobs);
+    std::fprintf(out,"Geometry jobs: %llu lists, %.3f ms/list snapshot, %.3f execution, %.3f materialization wait\n",(unsigned long long)j.jobs,j.copy_ns*scale,j.execute_ns*scale,j.wait_ns*scale);
+}
+
+void model2_video::geo_parse(){
+    geometry_wait();m_render_done=false;
+    if(m_geometry_execution!=geometry_execution::synchronous&&geometry_job_compatible()){
+        auto &j=*m_geometry_job;const auto start=std::chrono::steady_clock::now();
+        static const bool track_pages=std::getenv("VF2_TRACK_GEOMETRY_PAGES")!=nullptr;
+        const uint32_t pages=track_pages?m_geometry_dirty_pages:~uint32_t(0);
+        if(j.list.capture(m_bufferram,m_geo_read_start_address,m_geo_frame,pages)){
+            m_geometry_dirty_pages=0;
+            j.copy_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count());
+            ++j.jobs;j.pending=true;
+            if(m_geometry_execution==geometry_execution::worker)j.worker.start([this]{
+                auto &job=*m_geometry_job;
+                if(job.before_execution)job.before_execution();
+                execute_geometry_job();
+            });
+            return;
+        }
+    }
+    geo_parse_list(m_bufferram,m_geo_read_start_address,m_geo_frame);
+}
+
+void model2_video::geo_parse_list(u32 *buffer,u32 start,u64 frame){
+    if(m_smooth)smooth_record_start();
+    m_build_frame=frame;geo_run(buffer,start,m_geo.get(),m_raster.get());m_parsed_frame=frame;
+    if(m_smooth)smooth_record_end();
 }
 
 // The geometrizer through a display list (buffer RAM, or a copy kept for smooth motion)
 void model2_video::geo_run(u32 *buffer, u32 start, geo_state *geo, raster_state *raster)
 {
+	if(m_camera_packets&&raster==m_raster.get()){
+        m_camera_pending.clear();m_compact_camera_pending.clear();
+        if(m_shared_camera_pending)m_shared_camera_pending->clear();
+        m_camera_context_index=UINT32_MAX;m_camera_live=-1;
+        if(m_mesh_capture){
+            m_mesh_capture->active=nullptr;
+            m_mesh_capture->objects.clear();
+            m_mesh_capture->polygons.clear();
+        }
+    }
 	u32  address = (start & 0x1ffff)/4;
 	u32 *input = &buffer[address];
 	m_geo_end = buffer + 0x20000/4;   // (the commands' words read up to the buffer's end, never past it: GEO_NEXT)

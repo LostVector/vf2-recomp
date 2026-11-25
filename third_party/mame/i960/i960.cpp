@@ -657,9 +657,11 @@ void i960_cpu_device::do_call(uint32_t adr, int type, uint32_t stack)
 	if (m_rcache_pos >= I960_RCACHE_SIZE) {
 		// flush the current register set to the current frame
 		FP = m_r[I960_FP] & ~0x3f;
-		for (i = 0; i < 16; i++) {
-			m_program.write_dword(FP + (i*4), m_r[i]);
-		}
+		if (u8 *frame = m_program.direct_register_frame(FP))
+			memcpy(frame, m_r, sizeof m_rcache[0]);
+		else
+			for (i = 0; i < 16; i++)
+				m_program.write_dword(FP + (i*4), m_r[i]);
 	}
 	else    // a cache entry is available, use it
 	{
@@ -696,8 +698,11 @@ void i960_cpu_device::do_ret_0()
 	if ((m_rcache_pos >= I960_RCACHE_SIZE) || (m_rcache_pos < 0))
 	{
 		int i;
-		for(i=0; i<0x10; i++)
-			m_r[i] = m_program.read_dword(m_r[I960_FP]+4*i);
+		if (const u8 *frame = m_program.direct_register_frame(m_r[I960_FP]))
+			memcpy(m_r, frame, sizeof m_rcache[0]);
+		else
+			for(i=0; i<0x10; i++)
+				m_r[i] = m_program.read_dword(m_r[I960_FP]+4*i);
 
 		if (m_rcache_pos < 0)
 		{
@@ -786,6 +791,17 @@ void i960_cpu_device::execute_op(uint32_t opcode)
 {
 	uint32_t t1, t2;
 	double t1f, t2f;
+
+	const auto load_multiple = [&](uint32_t address, uint32_t base_register, int count) {
+		return read_multiple(address,base_register,count,[&](uint32_t a){
+			return i960_read_dword_unaligned_flags(a);
+		});
+	};
+	const auto store_multiple = [&](uint32_t address, uint32_t base_register, int count) {
+		return write_multiple(address,base_register,count,[&](uint32_t a,uint32_t value){
+			return i960_write_dword_unaligned_flags(a,value);
+		});
+	};
 
 	switch(opcode >> 24) {
 		case 0x08: // b
@@ -1612,12 +1628,11 @@ void i960_cpu_device::execute_op(uint32_t opcode)
 				}
 				for(t1=0; t1 < m_rcache_pos; t1++)
 				{
-					int i;
-
-					for (i = 0; i < 0x10; i++)
-					{
-						m_program.write_dword(m_rcache_frame_addr[t1] + (i * sizeof(uint32_t)), m_rcache[t1][i]);
-					}
+					if (u8 *frame = m_program.direct_register_frame(m_rcache_frame_addr[t1]))
+						memcpy(frame, m_rcache[t1], sizeof m_rcache[t1]);
+					else
+						for (int i = 0; i < 0x10; i++)
+							m_program.write_dword(m_rcache_frame_addr[t1] + (i * sizeof(uint32_t)), m_rcache[t1][i]);
 				}
 				m_rcache_pos = 0;
 				break;
@@ -2142,113 +2157,56 @@ void i960_cpu_device::execute_op(uint32_t opcode)
 			break;
 
 		case 0x98:{// ldl
-			int i;
 			m_icount -= 5;
 			t1 = get_ea(opcode);
 			t2 = (opcode>>19)&0x1e;
-			for(i=0; i<2; i++) {
-				auto pack = i960_read_dword_unaligned_flags(t1);
-				if(m_stalled)
-				{
-					burst_stall_save(t1,t2,i,2,false);
-					return;
-				}
-				m_r[t2+i] = pack.first;
-				if(pack.second & BURST)
-					t1 += 4;
-			}
+			if (!load_multiple(t1,t2,2))
+				return;
 			break;
 		}
 
 		case 0x9a:{// stl
-			int i;
 			m_icount -= 3;
 			t1 = get_ea(opcode);
 			t2 = (opcode>>19)&0x1e;
-			for(i=0; i<2; i++) {
-				auto flags = i960_write_dword_unaligned_flags(t1, m_r[t2+i]);
-				if(m_stalled)
-				{
-					burst_stall_save(t1,t2,i,2,true);
-					return;
-				}
-				if(flags & BURST)
-					t1 += 4;
-			}
+			if (!store_multiple(t1,t2,2))
+				return;
 			break;
 		}
 
 		case 0xa0:{// ldt
-			int i;
 			m_icount -= 6;
 			t1 = get_ea(opcode);
 			t2 = (opcode>>19)&0x1c;
-			for(i=0; i<3; i++) {
-				auto pack = i960_read_dword_unaligned_flags(t1);
-				if(m_stalled)
-				{
-					burst_stall_save(t1,t2,i,3,false);
-					return;
-				}
-				m_r[t2+i] = pack.first;
-				if(pack.second & BURST)
-					t1 += 4;
-			}
+			if (!load_multiple(t1,t2,3))
+				return;
 			break;
 		}
 
 		case 0xa2:{// stt
-			int i;
 			m_icount -= 4;
 			t1 = get_ea(opcode);
 			t2 = (opcode>>19)&0x1c;
-			for(i=0; i<3; i++) {
-				auto flags = i960_write_dword_unaligned_flags(t1, m_r[t2+i]);
-				if(m_stalled)
-				{
-					burst_stall_save(t1,t2,i,3,true);
-					return;
-				}
-				if(flags & BURST)
-					t1 += 4;
-			}
+			if (!store_multiple(t1,t2,3))
+				return;
 			break;
 		}
 
 		case 0xb0:{// ldq
-			int i;
 			m_icount -= 7;
 			t1 = get_ea(opcode);
 			t2 = (opcode>>19)&0x1c;
-			for(i=0; i<4; i++) {
-				auto pack = i960_read_dword_unaligned_flags(t1);
-				if(m_stalled)
-				{
-					burst_stall_save(t1,t2,i,4,false);
-					return;
-				}
-				m_r[t2+i] = pack.first;
-				if(pack.second & BURST)
-					t1 += 4;
-			}
+			if (!load_multiple(t1,t2,4))
+				return;
 			break;
 		}
 
 		case 0xb2:{// stq
-			int i;
 			m_icount -= 5;
 			t1 = get_ea(opcode);
 			t2 = (opcode>>19)&0x1c;
-			for(i=0; i<4; i++) {
-				auto flags = i960_write_dword_unaligned_flags(t1, m_r[t2+i]);
-				if(m_stalled)
-				{
-					burst_stall_save(t1,t2,i,4,true);
-					return;
-				}
-				if(flags & BURST)
-					t1 += 4;
-			}
+			if (!store_multiple(t1,t2,4))
+				return;
 			break;
 		}
 

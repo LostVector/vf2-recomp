@@ -41,7 +41,7 @@ FORCE:
 # MAME's i960 core and disassembler (third_party/mame), on our shim, with the recompiled code's
 # runtime (src/rec: the code found with the address map, src/rec/vf2_map.cpp, made native at start-up)
 CORE = third_party/mame/i960/i960.cpp third_party/mame/i960/i960dis.cpp src/core/mame_shim.cpp src/core/mb86233.cpp \
-	src/core/i960_device.cpp src/rec/i960_rec.cpp src/rec/i960_analyse.cpp src/rec/i960_native.cpp src/rec/vf2_map.cpp
+	src/core/mb86233_native.cpp src/core/i960_device.cpp src/rec/i960_rec.cpp src/rec/i960_analyse.cpp src/rec/i960_native.cpp src/rec/vf2_map.cpp
 MACHINE = src/machine/model2a.cpp src/machine/random_fighter.cpp src/machine/hud_names.cpp src/machine/model2_video.cpp src/machine/model2_smooth.cpp src/machine/scsp.cpp src/machine/scspdsp.cpp
 # MAME's 68000 (the sound board's CPU): the generated instruction handlers, unchanged
 M68000 = third_party/mame/m68000/m68000.cpp third_party/mame/m68000/m68000-decode.cpp \
@@ -326,5 +326,53 @@ audiocheck: $(BIN)/audiocheck
 
 # vf2watchsound: a late watcher's match sound after its catch-up against a from-the-start watcher's (join points swept)
 $(BIN)/vf2watchsound: $(call objs,tools/vf2watchsound.cpp src/host/vf2_netplay.cpp src/host/stb_image_impl.cpp $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000) $(NET)) $(SLJIT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
+
+# Legacy fbdev/Mali-400 validation; EGL/GLES2 only, no SDL3 dependency.
+$(OBJ)/tools/gpu3dcmp-gles2.o: tools/gpu3dcmp.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -DGPU3DCMP_GLES2=1 -MMD -MP -c $< -o $@
+$(BIN)/gpu3dcmp-gles2: $(OBJ)/tools/gpu3dcmp-gles2.o $(call objs,src/host/stb_image_impl.cpp $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000) src/gpu/gpu3d_gles2.cpp) $(SLJIT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS) -lEGL -lGLESv2
+
+ACM_LIBS ?= -lEGL -lGLESv2 -lasound
+$(BIN)/vf2checkpoint: $(call objs,tools/acm/checkpoint.cpp $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000)) $(SLJIT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN)/vf2-acm: $(call objs,src/host/acm_main.cpp src/host/stb_image_impl.cpp $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000) src/gpu/gpu3d_gles2.cpp src/gpu/gpu2d_gles2.cpp) $(SLJIT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS) $(ACM_LIBS)
+
+# Same DSP semantics, specialized for the player's uploaded microcode.
+$(OBJ)/src/core/mb86233_aot.o: override CXXFLAGS += -Ibuild/gen -ffp-contract=off
+$(OBJ)/src/core/mb86233_aot.o: build/gen/vf2_tgp.inc build/gen/vf2_tgp_blocks.inc build/gen/vf2_tgp_matrix_timing.inc
+$(BIN)/vf2-acm-tgp $(BIN)/vf2-acm-tgp-lto $(BIN)/vf2-acm-tgp-stats: $(call objs,src/host/acm_main.cpp src/host/stb_image_impl.cpp $(MACHINE) $(HOST) $(filter-out src/core/mb86233.cpp,$(CORE)) src/core/mb86233_aot.cpp $(GEN_NONE) $(M68000) src/gpu/gpu3d_gles2.cpp src/gpu/gpu2d_gles2.cpp) $(SLJIT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS) $(ACM_LIBS)
+
+$(BIN)/vf2checkpoint-tgp $(BIN)/vf2checkpoint-tgp-lto: $(call objs,tools/acm/checkpoint.cpp $(MACHINE) $(HOST) $(filter-out src/core/mb86233.cpp,$(CORE)) src/core/mb86233_aot.cpp $(GEN_NONE) $(M68000)) $(SLJIT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN)/vf2camera-check-tgp: $(call objs,tools/acm/check-camera-packets.cpp $(MACHINE) $(HOST) $(filter-out src/core/mb86233.cpp,$(CORE)) src/core/mb86233_aot.cpp $(GEN_NONE) $(M68000)) $(SLJIT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN)/check-i960-pc: $(call objs,tools/acm/check-i960-pc.cpp $(filter-out src/core/mb86233.cpp,$(CORE)) $(GEN_NONE)) $(SLJIT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN)/check-modular-clock: $(call objs,tools/acm/check-modular-clock.cpp $(MACHINE) $(HOST) $(filter-out src/core/mb86233.cpp,$(CORE)) src/core/mb86233_aot.cpp $(GEN_NONE) $(M68000)) $(SLJIT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN)/trace-fifo: $(call objs,tools/acm/trace-fifo.cpp $(MACHINE) $(HOST) $(filter-out src/core/mb86233.cpp,$(CORE)) src/core/mb86233_aot.cpp $(GEN_NONE) $(M68000)) $(SLJIT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN)/check-native-arithmetic: $(call objs,tools/acm/check-native-arithmetic.cpp $(filter-out src/core/mb86233.cpp,$(CORE)) $(GEN_NONE)) $(SLJIT_OBJ)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)

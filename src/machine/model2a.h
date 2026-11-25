@@ -17,6 +17,8 @@
 #pragma once
 #include "../core/i960_device.h"
 #include "../core/mb86233.h"
+#include "../core/constant_divisor.h"
+#include "../core/cycle_duration.h"
 #include "../rec/i960_native.h"
 #include "../host/romset.h"
 #include "mame_lite.h"
@@ -25,6 +27,7 @@
 #include "parallel.h"
 #include "scsp.h"
 #include "state_io.h"
+#include "word_fifo.h"
 #include "../../third_party/mame/m68000/m68000.h"
 #include "hud_names.h"
 #include <array>
@@ -38,6 +41,8 @@ class random_fighters;
 
 class model2a : public mame_bus32
 {
+    friend struct modular_clock_fixture;
+    friend struct fifo_trace_fixture;
 public:
 	static constexpr uint64_t CYCLES_PER_LINE = 1025;                  // 656 pixels at 16 MHz
 	static constexpr uint64_t LINES = 424, VBLANK_LINE = 384;
@@ -71,7 +76,15 @@ public:
 	// The state's first bytes are for this board's saves alone (which board, since which reset, which save): two
 	// boards in the same state have the same bytes after them, and only those are compared or hashed
 	static constexpr size_t STATE_HEADER = 24;
+	uint64_t modular_scheduler_frames()const{return m_modular_frames;}
 	uint64_t polygon_count_reads() const { return m_video->m_polygon_count_reads; }
+	// Host nanoseconds spent in the sound board's two parts (probe only, VF2_SOUND_PROFILE):
+	// the 68000's timeslices inside the scheduler, and the SCSP's sample update.
+	uint64_t sound_68k_ns() const { return m_sound_68k_ns; }
+	uint64_t sound_scsp_ns() const { return m_sound_scsp_ns; }
+	uint64_t sound_scsp_updates() const { return m_sound_scsp_updates; }
+	int sound_peak() const { return m_sound_peak; }
+	uint64_t sound_68k_cycles() const { return m_sched[CPU_68K].cycles; }
 	// A hash of the ROMs' contents as loaded, before any patch (the handshake's: both players need the same)
 	uint64_t rom_hash() const { return m_rom_hash; }
 
@@ -131,6 +144,7 @@ public:
 		u32 side_colour[2] = {};
 		const u32 *side_px = nullptr;
 		bool gpu3d = false;   // the 3D drawn by the host's gpu3d (has3d: something to show), not in px3d
+		bool gpu2d = false;   // native-resolution tile layers are held by the host
 	};
 	// The 3D on the GPU (the host's, src/gpu/gpu3d.h): given `gpu`, the 3D isn't drawn on the CPU
 	// but handed over: gpu(video, picture) with the RAMs as that picture's frame left them (its
@@ -140,8 +154,12 @@ public:
 	// edge columns): drawn on the CPU, or with gpu_only nothing at all (render_parts false: the
 	// host draws the picture whole). also_cpu: the CPU's 3D into px3d as well (checking the GPU's).
 	using gpu3d_hook = std::function<bool(model2_video &, int)>;
+	using gpu2d_hook = std::function<bool(const gpu2d_frame &)>;
+	void set_vblank_tile_hook(const std::function<void()> *hook) { m_vblank_tile_hook=hook; }
+	enum class vblank_tiles { unavailable, decoded, staged };
+	bool prepare_vblank_tiles(gpu2d_frame &frame);
 	bool render_parts(float alpha, u32 *px3d, size_t stride3d, bool async, picture_parts &parts,
-		const gpu3d_hook *gpu = nullptr, bool gpu_only = false, bool also_cpu = false);
+		const gpu3d_hook *gpu = nullptr, bool gpu_only = false, bool also_cpu = false, const gpu2d_hook *tiles = nullptr, vblank_tiles early_tiles = vblank_tiles::unavailable);
 	// Smooth motion (model2_smooth.cpp): each frame's 3D kept, so that a picture can be drawn for
 	// any moment between the last two frames (the picture a frame behind the game). The host's:
 	// off (vf2run) nothing is kept and nothing changes. render_smooth draws the moment `alpha`
@@ -258,6 +276,12 @@ public:
 	// Memory, as the i960 sees it (no side effects for RAM; devices are read as the CPU would).
 	u32 peek32(u32 a) { return read_dword(a); }
 	const std::vector<u8> &workram() const { return m_workram; }
+	// Low-memory hosts: these three regions are included in the checked ROM
+	// identity, but this VF2 board implementation never reads them at runtime.
+	// Call after construction so the original identity remains unchanged.
+	// Linux also discards private physical pages containing only zero ROM
+	// padding; their addresses and zero contents remain available on demand.
+	void release_unused_roms();
 	const segas24_tile &tiles() const { return m_tiles; }
 	// Online play's names under the energy bars (hud_names.h), in the 2D picture only, and their flags: "" none
 	void set_hud_names(const std::string names[2], const m2hud::Flag *flags[2] = nullptr)
@@ -432,6 +456,7 @@ public:
 	void write_word(offs_t a, u16 v) override;
 	void write_dword(offs_t a, u32 v) override;
 	u16 flags(offs_t a) override;
+	u8 *direct_register_frame(offs_t a) override;
 
 	// Inputs, active low as on the cabinet (IN0: coins, service, start; IN1/IN2: players)
 	u8 m_in0 = 0xff, m_in1 = 0xff, m_in2 = 0xff, m_sw = 0xff;
@@ -475,6 +500,7 @@ public:
 
 	// the sound board, for traces
 	uint64_t snd_cycles() const;   // the 68000's cycles since power-on
+	void report_cooperative_fifo(FILE *out)const;
 	uint64_t scsp_samples() const { return m_scsp->samples_made(); }
 	scsp_device &scsp() { return *m_scsp; }   // (made again at each reset())
 	std::function<void(u8)> on_uart_tx;      // each byte the main board sends the sound board
@@ -487,6 +513,8 @@ public:
 	uint32_t m_tgp_upload_words = 0;
 	uint64_t m_tgp_instructions = 0;
 	uint32_t m_uart_bytes = 0;
+	void reset_scheduler_stats();
+	void report_scheduler_stats(FILE *out)const;
 
 private:
 	struct tgp_bus;
@@ -532,7 +560,7 @@ private:
 	int m_hud_flag_at[2][2] = { { -1, -1 }, { -1, -1 } };
 
 	// ---- MAME's scheduler (emu/schedule.cpp, diexec.cpp) for the i960 and the TGP ----
-	using atime = unsigned __int128;   // attoseconds since power-on
+	using atime = vf2::uint128_t;   // attoseconds since power-on
 	static constexpr atime AS_PER_SEC = 1000000000000000000ull;
 	// in MAME's device order; the 68000 is held halted (as the reference runs it) and the
 	// billboard's Z80 runs its blank ROM: NOPs, which it executes in steps of 2 cycles
@@ -554,6 +582,15 @@ private:
 		T_LINE0,                               // + line: an input line's synchronize()
 		N_TIMERS = T_LINE0 + N_LINES
 	};
+#if defined(VF2_SCHED_DIAGNOSTICS)
+	struct scheduler_diagnostics {
+		uint64_t slices=0,passes=0,head_scans=0;
+		uint64_t visits[N_CPUS]={},dispatches[N_CPUS]={},active[N_CPUS]={},budget[N_CPUS]={},advanced[N_CPUS]={},early[N_CPUS]={};
+		uint64_t adjusted[N_TIMERS]={},fired[N_TIMERS]={};
+        uint64_t sync_abort[N_CPUS]={},sync_calls=0,single_line=0,batched_line=0;
+	};
+	mutable scheduler_diagnostics m_scheduler_diagnostics;
+#endif
 	struct timer { atime expire = 0, start = 0, period = 0; uint64_t seq = 0; bool enabled = false; u32 param = 0; };
 	struct cpu_sched
 	{
@@ -562,6 +599,8 @@ private:
 		uint64_t cycles = 0;   // local / period (local only ever moves by whole cycles)
 		int divshift = 0;
 		u32 divisor = 0;
+		vf2::constant_divisor divide_cycles;
+		vf2::cycle_duration elapsed;
 		u32 suspend = 0, nextsuspend = 0;
 		bool eat = false, nexteat = false;
 		void set_rate(uint64_t cycles_per_second);
@@ -580,31 +619,53 @@ private:
 	uint64_t m_tgp_cycle_base = 0;   // MAME counts the TGP's cycles from its last reset
 	atime time() const;
 	mutable int m_head = -1;          // the first timer to fire (cached; -1: work it out again)
+	int m_timer_first=-1;
+	int8_t m_timer_prev[N_TIMERS]={},m_timer_next[N_TIMERS]={}; // derived, not serialized
+	void timer_enqueue(int id);
+	void timer_unlink(int id);
+	void rebuild_timer_queue();
 	int timer_head() const;
 	void timer_disable(int id);
 	void timer_adjust(int id, atime delay, u32 param = 0, atime period = 0);
+    void timer_sync(int id);
 	int m_callback_timer = -1;        // the timer whose callback is running, and whether it changed it
 	bool m_callback_modified = false;
 	void abort_timeslice();
 	void set_input_line(int line, int state);
 	void apply_line(int line);
+    void apply_line_state(int line,int state);
 	void suspend(int cpu, u32 reason);
 	void resume(int cpu, u32 reason);
 	void apply_suspend_changes();
 	void timeslice();
+	template<bool LazyAux,bool NarrowGap,bool Modular,bool FrameDivision=false,bool SkipInert=false> void timeslice_impl();
+    bool modular_frame_ready()const;
+	void advance_aux_clocks(const atime &target);
+	void sync_instruction_hook(int id);
 	void timer_fired(int id);
 
 	// MAME's generic_fifo_u32_device, 8 deep, with model2_tgp_state's callbacks
 	struct gen_fifo
 	{
-		std::deque<u32> values, extra;
+		m2::word_fifo values;
+		std::deque<u32> extra;
 		bool empty_triggered = false, full_triggered = false;
 		bool is_full() const { return values.size() >= 8; }
 	};
 	gen_fifo m_fifo_in, m_fifo_out;    // i960 -> TGP, TGP -> i960
+	bool m_cooperative_ready=false,m_cooperative_pumping=false,m_cooperative_wait_input=false;
+	uint64_t m_cooperative_calls=0,m_cooperative_cycles=0,m_cooperative_max_input=0;
+	uint64_t m_cooperative_wait_cycles=0;
+	std::deque<atime> m_cooperative_output_ready;
+	atime m_cooperative_cpu_ready=0;
+	bool m_cooperative_read_waited=false;
+	void prepare_cooperative_fifo();
+	void service_cooperative_tgp();
+	bool cooperative_wait_until(const atime &ready);
 	u32 fifo_pop(bool out);
 	void fifo_push(bool out, u32 v);
 	void fifo_clear(bool out);
+	void assert_fifo_halt(int line);
 	void fifo_sync_empty(bool out);
 	void fifo_sync_full(bool out);
 
@@ -649,7 +710,7 @@ private:
 	bitmap_rgb32 m_screen, m_sys24, m_sys24_mid, m_sys24_top;
 	u32 under_3d(int y, int x) const { const u32 p = m_sys24_mid.pix(y, x); return p ? p : m_sys24.pix(y, x); }
 	void draw_picture(u32 *out, size_t stride, bool polygons, bool async, float alpha = -1, picture_parts *parts = nullptr,
-		const gpu3d_hook *gpu = nullptr, bool also_cpu = false);
+		const gpu3d_hook *gpu = nullptr, bool also_cpu = false, const gpu2d_hook *tiles = nullptr, vblank_tiles early_tiles = vblank_tiles::unavailable);
 	// the frame's 2D state, kept when a picture of it is still held once the game runs on
 	struct frame_2d {
 		uint64_t frame = 0;
@@ -664,7 +725,12 @@ private:
 	void keep_2d();
 	void swap_2d(frame_2d &f);   // the frame's 2D state in place of the live one (and back)
 	void bd_pixels(int mode, double dh, double dv, int &dx, int &dy) const;
-	void draw_2d(bool polygons, bool parts);
+	void draw_2d(bool polygons, bool parts, const gpu2d_hook *tiles = nullptr, vblank_tiles early_tiles = vblank_tiles::unavailable);
+	void prepare_tile_planes();
+	void build_gpu_tile_frame(bool hud_off,gpu2d_frame &frame);
+	bool custom_hud_names();
+	void publish_gpu_tiles();
+	bool m_gpu2d_active = false;
 	bool m_2d_wide = false, m_2d_filter = false;   // what the last draw_2d drew
 	bool m_hud_hidden = false;   // (set_hud_hidden: the host's, read when a picture's 2D is drawn)
 	int m_fc_dx = 0, m_fc_dy = 0;   // (the free camera's move of the backdrop for the picture being drawn: arcade pixels)
@@ -692,7 +758,7 @@ private:
 	// The 3D's RAMs changing: a deferred picture drawn, a picture being drawn finished, and with
 	// smooth motion the change kept (m_ram_log)
 	enum { RAM_XLAT, RAM_TEX0, RAM_TEX1, RAM_LUMA, RAM_PAL };
-	void note_gpu_ram(int kind);
+	void note_gpu_ram(int kind,u32 offset=~0u);
 	void before_3d_ram_change(int kind, u32 offset, u32 old, u32 now);
 	struct ram_change { uint64_t frame; u8 kind; u32 offset, old, now; };
 	std::vector<ram_change> m_ram_log;   // the last frames' changes, oldest first
@@ -824,5 +890,11 @@ private:
 	u32 dev_read(u32 a, u32 mem_mask);
 	void dev_write(u32 a, u32 data, u32 mem_mask);
 	void unmapped(u32 a, bool write);
+	bool m_modular_frame=false;
+    uint64_t m_modular_frames=0;
+	uint64_t m_sound_68k_ns=0,m_sound_scsp_ns=0,m_sound_scsp_updates=0;
+	int m_sound_peak=0;
 	void milestone(const std::string &s) { if (on_milestone) on_milestone(s); }
+    static void collapse_i960_timer_poll(void *context,u32 limit,u32 &counter,int &budget);
+    const std::function<void()> *m_vblank_tile_hook=nullptr;
 };

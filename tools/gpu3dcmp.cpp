@@ -18,6 +18,9 @@
 #ifdef GPU3DCMP_SDLGPU
 #include <SDL3/SDL.h>
 #endif
+#ifdef GPU3DCMP_GLES2
+#include "../src/host/egl_context.h"
+#endif
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -42,7 +45,11 @@ int main(int argc, char **argv)
 	const std::string out = argc > 7 ? argv[7] : "build/gpu3d";
 	std::set<int> pngs; if (argc > 8) for (int f : ints(argv[8])) pngs.insert(f);
 	std::filesystem::create_directories(out);
-#ifdef GPU3DCMP_SDLGPU
+#ifdef GPU3DCMP_GLES2
+	vf2_egl_context egl;
+	if (!egl.open(true)) { fprintf(stderr, "EGL context failed: %x\n", eglGetError()); return 1; }
+	std::unique_ptr<gpu3d> gpu = gpu3d_create_gles2();
+#elif defined(GPU3DCMP_SDLGPU)
 	// SDL_GPU (Vulkan, Direct3D 12): headless, SDL_VIDEODRIVER=offscreen without a display
 	if (!SDL_Init(SDL_INIT_VIDEO)) { fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1; }
 	std::unique_ptr<gpu3d> gpu = gpu3d_create_sdlgpu();
@@ -73,6 +80,19 @@ int main(int argc, char **argv)
 				model2_video &v = m.video();
 				v.export_shown(list);
 				if (list.empty()) continue;
+				if (getenv("GPU3DCMP_TEXTURE_STATS")) {
+					float max_span=0,max_uv=0,min_depth=1e30f,max_depth=0; int wide=0,textured=0;
+					for (const auto &p:list) if ((p.renderer&2) && p.texw && p.texh) {
+						float lo[2]={1e30f,1e30f},hi[2]={-1e30f,-1e30f};
+						for (int k=0;k<p.n;k++) if (p.z[k]>0) {
+							float uv[2]={p.u[k]/p.z[k]/p.texw,p.v[k]/p.z[k]/p.texh};
+							for(int a=0;a<2;a++){lo[a]=std::min(lo[a],uv[a]);hi[a]=std::max(hi[a],uv[a]);max_uv=std::max(max_uv,std::abs(uv[a]));}
+							min_depth=std::min(min_depth,1/p.z[k]);max_depth=std::max(max_depth,1/p.z[k]);
+						}
+						float span=std::max(hi[0]-lo[0],hi[1]-lo[1]);max_span=std::max(max_span,span);wide+=span>2;textured++;
+					}
+					fprintf(stderr,"texture stats frame %d: %d textured, %d span>2, max span %.3f repeats, max |UV| %.3f, depth %.3f..%.3f\n",f,textured,wide,max_span,max_uv,min_depth,max_depth);
+				}
 				int w, h; v.render_size(w, h);
 				const size_t N = size_t(w) * h;
 				co.assign(N, 0); go.assign(N, 0); cc.assign(N, 0); gg.assign(N, 0);

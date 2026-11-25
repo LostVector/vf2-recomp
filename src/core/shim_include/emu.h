@@ -4,6 +4,7 @@
 #pragma once
 #include "../mame_shim.h"
 #include "../dasm_shim.h"
+#include <bit>
 #include <map>
 #include <memory>
 #include <vector>
@@ -35,6 +36,10 @@ struct device_memory_interface
 	using space_config_vector = std::vector<std::pair<int, const address_space_config *>>;
 };
 
+// Aligned words at these ports retain address and access flags within a multiword instruction.
+inline constexpr uint16_t VF2_FIXED_LOAD_PORT=0x4000;
+inline constexpr uint16_t VF2_FIXED_STORE_PORT=0x8000;
+
 // A 32-bit little-endian bus. The flags are MAME's per-region map flags (the i960 core's BURST).
 struct mame_bus32
 {
@@ -46,6 +51,8 @@ struct mame_bus32
 	virtual void write_word(offs_t a, u16 v) = 0;
 	virtual void write_dword(offs_t a, u32 v) = 0;
 	virtual u16 flags(offs_t a) { return 0; }
+	// The whole 64-byte frame must be writable RAM without bus side effects.
+	virtual u8 *direct_register_frame(offs_t) { return nullptr; }
 };
 
 template <int Width, int AddrShift, int Level, endianness_t Endian> struct memory_access
@@ -63,6 +70,16 @@ template <int Width, int AddrShift, int Level, endianness_t Endian> struct memor
 		std::pair<u32, u16> read_dword_flags(offs_t a) { u16 f = bus->flags(a); return { bus->read_dword(a), f }; }
 		u16 write_byte_flags(offs_t a, u8 v) { u16 f = bus->flags(a); bus->write_byte(a, v); return f; }
 		u16 write_dword_flags(offs_t a, u32 v) { u16 f = bus->flags(a); bus->write_dword(a, v); return f; }
+
+		u8 *direct_register_frame(offs_t a)
+		{
+			if constexpr (std::endian::native == std::endian::little) {
+				static const bool enabled = std::getenv("VF2_I960_DIRECT_REGISTER_FRAME") != nullptr;
+				if (enabled && (a & 63u) == 0)
+					return bus->direct_register_frame(a);
+			}
+			return nullptr;
+		}
 	};
 	struct cache : specific {};
 };

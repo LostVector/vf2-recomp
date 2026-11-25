@@ -268,11 +268,11 @@ void model2_video::smooth_record_start()
 
 void model2_video::smooth_record_end() { m_rec = nullptr; }
 
-void model2_video::smooth_note_object(u32 oba, const float *matrix)
+void model2_video::smooth_note_object(u32 oba,u32 count,u32 mode,u32 tpa,u32 tha,const float *matrix,float focus_x,float focus_y)
 {
 	smooth_rec::object o;
-	o.oba = oba;
-	memcpy(o.m, matrix, sizeof o.m);
+	o.oba=oba;o.count=count;o.mode=mode;o.tpa=tpa;o.tha=tha;
+	memcpy(o.m,matrix,sizeof o.m);o.focus[0]=focus_x;o.focus[1]=focus_y;
 	m_rec->objects.push_back(o);
 }
 

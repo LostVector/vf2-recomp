@@ -38,6 +38,7 @@
 #define COMBINE_DATA(varptr) (*(varptr) = (*(varptr) & ~mem_mask) | (data & mem_mask))
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace {
 // attotime::from_ticks
@@ -1209,6 +1210,33 @@ inline s32 scsp_device::UpdateSlot(SCSP_SLOT *slot)
 
 void scsp_device::DoMasterSamples(int samples)
 {
+	// Cost probe only: keep the 68000, the UART link, the timers and the
+	// scheduler running, but make the mixer write silence. If the sound
+	// board's tail disappears, the cost is the mixer/DSP; if it does not,
+	// the cost is elsewhere in the board.
+	static const bool silence=std::getenv("VF2_SCSP_SILENCE")!=nullptr;
+	if(silence){
+		m_BUFPTR=(m_BUFPTR+32*(samples&1))&63;
+		m_RBUFDST=m_RINGBUF+((m_BUFPTR+63)&63);
+		m_DSP.EXTS[0]=m_DSP.EXTS[1]=0;
+		m_out.resize(m_out.size()+size_t(samples)*2,0.0f);
+		return;
+	}
+#if !SCSP_FM_DELAY
+	if (samples > 0 && !m_group_gains && !m_probe && m_DSP.Stopped &&
+	    size_t(samples) <= (m_out.max_size() - m_out.size()) / 2 &&
+	    std::none_of(std::begin(m_Slots), std::end(m_Slots), [](const auto &slot) { return slot.active; }) &&
+	    std::all_of(std::begin(m_DSP.EFREG), std::end(m_DSP.EFREG), [](s16 sample) { return sample == 0; }))
+	{
+		// Inactive slots leave the FM ring contents alone. Each silent sample
+		// still advances the ring cursor by 32 slots.
+		m_BUFPTR = (m_BUFPTR + 32 * (samples & 1)) & 63;
+		m_RBUFDST = m_RINGBUF + ((m_BUFPTR + 63) & 63);
+		m_DSP.EXTS[0] = m_DSP.EXTS[1] = 0;
+		m_out.resize(m_out.size() + size_t(samples) * 2, 0.0f);
+		return;
+	}
+#endif
 	for (int s = 0; s < samples; ++s)
 	{
 		s32 smpl = 0, smpr = 0;

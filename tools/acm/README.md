@@ -6155,6 +6155,7 @@ environment. Leave the variable unset for the default path.
 | `VF2_STACK_FLAT_CLIP` | Clip flat polygons with three to eight vertices using fixed-size stack buffers. |
 | `VF2_CACHE_BATCH_TEXTURE_BINDS` | Reuse atlas bindings within the draw loop when a texture unit's page is unchanged. |
 | `VF2_FAST_FAN_CELL_COMPARE` | Use single-precision bounds for retained fans, with a double-precision check at rounded cell edges. Applies when `VF2_RETAINED_FAN_CELL_BOUNDS` is enabled. |
+| `VF2_ATLAS_LARGE_PAGES` | Start packed texture pages at 1032 pixels per side. Pair with `VF2_ATLAS_LIMIT_MB=16` for the tested Shun configuration. |
 | `VF2_GLES_EDGE_AA` | Request 4× multisampling on the GLES 3D target. Requires support for `GL_EXT_multisampled_render_to_texture`. Check the startup log after the first 3D scene for the active sample count and target size. |
 
 In a historical Shun fight replay at 1.344 GHz, the texture-cell check

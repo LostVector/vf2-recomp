@@ -6155,6 +6155,7 @@ environment. Leave the variable unset for the default path.
 | `VF2_STACK_FLAT_CLIP` | Clip flat polygons with three to eight vertices using fixed-size stack buffers. |
 | `VF2_CACHE_BATCH_TEXTURE_BINDS` | Reuse atlas bindings within the draw loop when a texture unit's page is unchanged. |
 | `VF2_FAST_FAN_CELL_COMPARE` | Use single-precision bounds for retained fans, with a double-precision check at rounded cell edges. Applies when `VF2_RETAINED_FAN_CELL_BOUNDS` is enabled. |
+| `VF2_ATLAS_LARGE_PAGES` | Start packed texture pages at 1032 pixels per side. Pair with `VF2_ATLAS_LIMIT_MB=16` for the tested Shun configuration. |
 | `VF2_GLES_EDGE_AA` | Request 4× multisampling on the GLES 3D target. Requires support for `GL_EXT_multisampled_render_to_texture`. Check the startup log after the first 3D scene for the active sample count and target size. |
 
 In a historical Shun fight replay at 1.344 GHz, the texture-cell check
@@ -6164,6 +6165,31 @@ phase profiling disabled held p50 at 18.444 ms and moved p99 from
 The VF2 runs that included the stack clipper and the texture binding
 cache changed both together, so they give no separate VF2 timing for
 either option.
+
+## Native i960 floating-point compare
+
+Set `VF2_REC_NATIVE_CMPR=1` to inline i960 floating-point compares. The
+Mini's Thumb-2 backend evaluates the ordered conditions from one VFP
+compare. The option preserves guest cycles and arithmetic-control bits.
+Two Shun comparisons at 1.200 GHz showed a 0.47 to 0.58 ms lower median
+simulation CPU time. In a four-way check on a binary also containing the
+experimental inline dispatcher, the compare-only median rose from
+17.464 to 17.553 ms. Game, core and geometry state matched in every
+comparison. Keep the compare available for further testing.
+
+## Profiled VF2 DSP regions
+
+Set `VF2_TGP_HOT_REGIONS=1` to group 16 straight-line DSP spans
+identified during Shun combat. This requires a regenerated VF2 AOT
+table and a matching uploaded DSP program. The existing region guard
+preserves single-step execution when the slice is too short, repeat
+is active, or tracing or debugger callbacks are enabled.
+
+In a same-binary Shun replay at 1.200 GHz, median simulation CPU time
+fell from 18.142 to 17.520 ms and the grouped path removed 14.66 million
+individual dispatches across the replay. Game and geometry state
+matched and both runs had clean speaker audio. These results are from
+an untrained DSP build. The option is available for further testing.
 
 ## Opt-in VF2 detached audio
 
@@ -6188,3 +6214,36 @@ tested release settings are 160 ms and 95 ms respectively. A larger
 reserve costs playback latency. For a deterministic muted replay,
 `VF2_SOUND_PCM_HASH=1` reports a PCM digest and waits for each source
 tick to be processed without queue drops.
+
+For the detached VF2 board, `VF2_SOUND_FAST_RAM=1` uses direct 68000
+program and opcode RAM accesses with the same one-cycle wait and retry
+semantics. `VF2_SOUND_CYCLE_SAMPLE_INDEX=1` derives the SCSP sample
+index from the executing 68000 clock and retains the attosecond path
+for timer callbacks and unsupported times. Both options default off.
+Add `VF2_PROVE_SOUND_CYCLE_SAMPLE_INDEX=1` in a diagnostic run to
+compare the cycle-derived results with the reference conversion.
+
+The ARM timing fixture preserved 19,549 timed device accesses while
+bypassing 153,036 RAM callbacks. Fresh Shun training and the resulting
+profile-use build both produced the reference PCM digest, covering
+2,529,966 sample frames. The Dural speaker replay measured 9.306 to
+8.298 ms of synthesis per tick with the two options enabled. Neither
+arm reported an underrun, audio error, or dropped source tick.
+
+## Cached VF2 DSP handler entry
+
+Set `VF2_TGP_CACHED_ENTRY=1` together with
+`VF2_TGP_CACHE_PROFILED_ENTRY=1` to reuse the validated profiled DSP
+handler table on stable mapped slices. Programs with changed pointers
+or revisions, pending continuations, and debugger hooks use the regular
+entry checks. The option requires the profiled-region preset and remains
+off by default.
+
+On the Astro City Mini at 1.200 GHz and native 4x MSAA, this option
+reduced paired median simulation CPU by 0.192 ms on Dural and 0.186 ms
+on sustained Shun. Shun delivered p50/p95/p99 changed from
+18.137/19.850/21.144 to 17.951/19.627/20.980 ms. Both Shun replays
+matched game, geometry, compiled instruction and draw counts, and logged
+zero audio errors. A Cortex-A7 fixture exercised 393,216 slices with
+stable and changed program mappings and matched full CPU/RAM state and
+callback timing.

@@ -218,6 +218,36 @@ struct material_hash {
 class gles2 final:public gpu3d {
     GLuint program=0,fbo=0,depth_buffer=0,vbo=0,tile_vbo=0,palette_atlas=0,palette_spare=0,sheets[4]={};
     PFNGLDISCARDFRAMEBUFFEREXTPROC discard_framebuffer=nullptr;
+    PFNGLFRAMEBUFFERTEXTURE2DMULTISAMPLEEXTPROC attach_msaa = nullptr;
+    PFNGLRENDERBUFFERSTORAGEMULTISAMPLEEXTPROC depth_msaa = nullptr;
+    const bool edge_aa = std::getenv("VF2_GLES_EDGE_AA") != nullptr;
+    bool edge_target_verified = false;
+    static constexpr GLsizei edge_samples = 4;
+
+    void attach_color(int target) {
+        if (edge_aa)
+            attach_msaa(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, targets[target], 0,
+                        edge_samples);
+        else
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, targets[target], 0);
+    }
+
+    bool verify_edge_target() {
+        if (!edge_aa || edge_target_verified)
+            return true;
+        GLint samples = 0;
+        const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+            GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_SAMPLES_EXT, &samples);
+        if (status != GL_FRAMEBUFFER_COMPLETE || samples != edge_samples) {
+            std::fprintf(stderr, "VF2 edge AA framebuffer unavailable (status %x, %d samples)\n",
+                         status, samples);
+            return false;
+        }
+        edge_target_verified = true;
+        std::fprintf(stderr, "VF2 GLES edge AA: %dx MSAA, %dx%d\n", samples, width, height);
+        return true;
+    }
     bool direct_tiles=false;
     bool use_batches=false,indexed_batches=false,frame_indexed=false,index_overflow=false,stack_packets=false;
     GLuint tile_ibo=0;
@@ -1704,8 +1734,12 @@ class gles2 final:public gpu3d {
     bool paint_batch(const gpu3d_frame &f,int target,bool owners){
         auto phase=trace_slow_submits?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
         GLint prior;glGetIntegerv(GL_FRAMEBUFFER_BINDING,&prior);
-        glBindFramebuffer(GL_FRAMEBUFFER,fbo);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,targets[target],0);
+        glBindFramebuffer(GL_FRAMEBUFFER,fbo);attach_color(target);
         glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_RENDERBUFFER,depth_buffer);
+        if (!verify_edge_target()) {
+            glBindFramebuffer(GL_FRAMEBUFFER, prior);
+            return false;
+        }
         if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){glBindFramebuffer(GL_FRAMEBUFFER,prior);return false;}
         if(!owners&&f.underlay&&!paint_underlay(f)){glBindFramebuffer(GL_FRAMEBUFFER,prior);return false;}
         trace_submit_phase("target-underlay",phase);
@@ -1925,8 +1959,12 @@ class gles2 final:public gpu3d {
             glBufferData(GL_ARRAY_BUFFER,frame_vertices.size()*sizeof(vf2_tiles::vertex),frame_vertices.data(),GL_STREAM_DRAW);
         }
         GLint prior;glGetIntegerv(GL_FRAMEBUFFER_BINDING,&prior);
-        glBindFramebuffer(GL_FRAMEBUFFER,fbo);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,targets[target],0);
+        glBindFramebuffer(GL_FRAMEBUFFER,fbo);attach_color(target);
         glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_RENDERBUFFER,depth_buffer);
+        if (!verify_edge_target()) {
+            glBindFramebuffer(GL_FRAMEBUFFER, prior);
+            return false;
+        }
         if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){glBindFramebuffer(GL_FRAMEBUFFER,prior);return false;}
         if(!owners&&f.underlay&&!paint_underlay(f)){glBindFramebuffer(GL_FRAMEBUFFER,prior);return false;}
         glViewport(0,0,width,height);glEnable(GL_DEPTH_TEST);glDepthFunc(GL_LESS);glDepthMask(GL_TRUE);glClearDepthf(1.f);glDisable(GL_CULL_FACE);glDisable(GL_BLEND);glDisable(GL_SCISSOR_TEST);
@@ -2049,6 +2087,23 @@ public:
     }
     bool init() {
         if(!glGetString(GL_VERSION))return false;
+        if (edge_aa) {
+            const auto *extensions = reinterpret_cast<const char *>(glGetString(GL_EXTENSIONS));
+            if (!extensions || !std::strstr(extensions, "GL_EXT_multisampled_render_to_texture")) {
+                std::fputs("VF2 GLES edge AA requires multisampled render to texture\n", stderr);
+                return false;
+            }
+            attach_msaa = reinterpret_cast<PFNGLFRAMEBUFFERTEXTURE2DMULTISAMPLEEXTPROC>(
+                eglGetProcAddress("glFramebufferTexture2DMultisampleEXT"));
+            depth_msaa = reinterpret_cast<PFNGLRENDERBUFFERSTORAGEMULTISAMPLEEXTPROC>(
+                eglGetProcAddress("glRenderbufferStorageMultisampleEXT"));
+            GLint max_samples = 0;
+            glGetIntegerv(GL_MAX_SAMPLES_EXT, &max_samples);
+            if (!attach_msaa || !depth_msaa || max_samples < edge_samples) {
+                std::fputs("VF2 GLES edge AA cannot allocate four hardware samples\n", stderr);
+                return false;
+            }
+        }
         if(!std::getenv("VF2_KEEP_DEPTH")&&std::strstr(reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS)),"GL_EXT_discard_framebuffer"))
             discard_framebuffer=reinterpret_cast<PFNGLDISCARDFRAMEBUFFEREXTPROC>(eglGetProcAddress("glDiscardFramebufferEXT"));
         GLint units=0;glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS,&units);if(units<5)return false;
@@ -2132,7 +2187,12 @@ public:
         if(cull_sampleless)glGetIntegerv(GL_SUBPIXEL_BITS,&raster_subpixel_bits);
         if(w==width&&h==height&&int(targets.size())==count)return true;
         glDeleteTextures(targets.size(),targets.data());targets.assign(count,0);glGenTextures(count,targets.data());width=w;height=h;
-        glBindRenderbuffer(GL_RENDERBUFFER,depth_buffer);glRenderbufferStorage(GL_RENDERBUFFER,GL_DEPTH_COMPONENT16,w,h);
+        glBindRenderbuffer(GL_RENDERBUFFER,depth_buffer);
+        edge_target_verified = false;
+        if (edge_aa)
+            depth_msaa(GL_RENDERBUFFER, edge_samples, GL_DEPTH_COMPONENT16, w, h);
+        else
+            glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, w, h);
         for(GLuint t:targets){glBindTexture(GL_TEXTURE_2D,t);texture_parameters();glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,w,h,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);}
         return glGetError()==GL_NO_ERROR;
     }
@@ -2257,7 +2317,7 @@ public:
     bool read_target(int target,uint32_t *out,size_t stride)override {
         if(target<0||size_t(target)>=targets.size())return false;
         GLint prior;glGetIntegerv(GL_FRAMEBUFFER_BINDING,&prior);glBindFramebuffer(GL_FRAMEBUFFER,fbo);
-        glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,targets[target],0);
+        attach_color(target);
         std::vector<uint8_t> bytes(size_t(width)*height*4);glReadPixels(0,0,width,height,GL_RGBA,GL_UNSIGNED_BYTE,bytes.data());
         for(int y=0;y<height;y++)for(int x=0;x<width;x++) {
             auto p=&bytes[(size_t(height-1-y)*width+x)*4];out[size_t(y)*stride+x]=(uint32_t(p[3])<<24)|(uint32_t(p[0])<<16)|(uint32_t(p[1])<<8)|p[2];

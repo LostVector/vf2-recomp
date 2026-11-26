@@ -6166,13 +6166,18 @@ The VF2 runs that included the stack clipper and the texture binding
 cache changed both together, so they give no separate VF2 timing for
 either option.
 
-## Profiled VF2 DSP regions
+## Native i960 floating-point compare
 
 Set `VF2_REC_NATIVE_CMPR=1` to inline i960 floating-point compares. The
 Mini's Thumb-2 backend evaluates the ordered conditions from one VFP
-compare. Matched Shun replays at 1.200 GHz saved 0.47?0.58 ms of median
-simulation CPU time with matching game, core, and geometry state. The
-option preserves the guest cycle count and arithmetic-control bits.
+compare. The option preserves guest cycles and arithmetic-control bits.
+Two Shun comparisons at 1.200 GHz showed a 0.47 to 0.58 ms lower median
+simulation CPU time. In a four-way check on a binary also containing the
+experimental inline dispatcher, the compare-only median rose from
+17.464 to 17.553 ms. Game, core and geometry state matched in every
+comparison. Keep the compare available for further testing.
+
+## Profiled VF2 DSP regions
 
 Set `VF2_TGP_HOT_REGIONS=1` to group 16 straight-line DSP spans
 identified during Shun combat. This requires a regenerated VF2 AOT

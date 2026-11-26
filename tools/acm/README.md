@@ -6168,6 +6168,12 @@ either option.
 
 ## Profiled VF2 DSP regions
 
+Set `VF2_REC_NATIVE_CMPR=1` to inline i960 floating-point compares. The
+Mini's Thumb-2 backend evaluates the ordered conditions from one VFP
+compare. Matched Shun replays at 1.200 GHz saved 0.47?0.58 ms of median
+simulation CPU time with matching game, core, and geometry state. The
+option preserves the guest cycle count and arithmetic-control bits.
+
 Set `VF2_TGP_HOT_REGIONS=1` to group 16 straight-line DSP spans
 identified during Shun combat. This requires a regenerated VF2 AOT
 table and a matching uploaded DSP program. The existing region guard

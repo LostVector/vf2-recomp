@@ -1,8 +1,41 @@
 # Astro City Mini VF2 handoff
 
-Checkpoint from November 20, 2026. Independent priority reviews now run every 4 hours, not every hour (user update, 2026-11-20).
+Current VF2 checkpoint from November 26, 2026. The sections below it retain the November 20 baseline and earlier experiment history.
 
 For Daytona USA, see the [current Daytona priorities](DAYTONA.md#current-priorities).
+
+## Current VF2 performance plan
+
+The performance investigation is paused. The current target is sustained
+Shun combat at p99 of 17.384 ms or less on the Mini at a sampled 1.200 GHz.
+Use full-rate 496?384 with actual 4? MSAA, 44.1 kHz speaker audio,
+and the established worker placement. Evaluate combat ticks 1800?3300
+separately from warmup, arena entry, and capture. Keep the ROM ZIP and
+benchmark data on the PC between runs.
+
+The cached profiled DSP entry reduced Shun simulation CPU by 0.186 ms
+at the paired median. Delivered p50/p95/p99 were 17.951/19.627/20.980 ms
+for that candidate. The later linked-register and shared cell-split
+prototypes did not show a repeatable improvement. Atlas capacity helped
+attract mode when the cap rose from 16 to 32 MiB. In the 18,000-tick
+attract replay both 32 and 128 MiB used the same eight pages and had zero
+capacity fallbacks. Continue using 32 MiB for attract comparisons.
+
+1. Use the sustained Shun traces to distinguish CPU-heavy ticks from
+   renderer waits. Measure cycle and call distributions across whole DSP
+   command paths and at mixed i960 register/bus boundaries. Screen
+   changes that reduce work across these paths while preserving callback
+   order, cycle boundaries, and resumed slices.
+2. Profile remaining packet costs at the worker level before changing the
+   renderer again. Favor reductions in repeated preparation and emitted
+   data across real draws. The measured two-cell sharing variants have
+   been screened and are archived.
+3. Screen promising changes on Dural. Require two full Shun passes at the
+   target and a confirming Dural pass before replacing the interactive
+   build. Check state and draws, zero audio faults and skipped frames,
+   exact muted PCM, moving captures, and the volume chord. Restore and
+   verify the interactive build after each hardware job.
+
 
 ## Goal and current state
 

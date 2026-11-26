@@ -7,6 +7,30 @@ collision data, the cabinet's Z80 I/O firmware and Model 1 sound through a
 68000, YM3438 and two MultiPCM chips. A fresh cabinet starts with single-cabinet
 settings. The build uses Daytona-specific objects and i960 coverage.
 
+## Current priorities
+
+The performance target is a delivered-frame p99 of 17.384 ms or less and
+at least 99% on-time fresh frames on Beginner, Intermediate, and Expert.
+Measure sustained races with full drawing and quiet speaker audio. Keep
+loading, warmup, and captures outside the timing window. Capture moving
+frames in a separate replay to verify visual output.
+
+- **Beginner:** Reduce packet construction and Mali workload together.
+  Matched packet replay exposed more than 2 ms of simulation CPU cost
+  from concurrent rendering and 5.79–7.78 ms of GPU wait. Measure both
+  costs on heavy race frames and their successors.
+- **Intermediate:** Resolve the atlas sampling discrepancy before changing
+  texture coordinates. A diagnostic that sampled the center of one
+  constant-color tile removed its dependence on surrounding atlas contents.
+  A general fix needs to derive the constant-color condition from decoded
+  texels and invalidate it on texture RAM writes.
+- **Expert:** Reduce clipping, packing, and composition work. Compare
+  delivered frame times and on-time freshness alongside CPU time.
+
+Compare core and geometry state, draw order, rendered pixels, and audio
+when qualifying a renderer change. Keep clean and candidate launch
+settings and clock rates in the run record.
+
 ## Build and run
 
 Copy your `daytona.zip` into `roms/`. It must contain the shared CPU board

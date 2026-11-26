@@ -1,6 +1,7 @@
 # Astro City Mini native target â€” development in progress
 
 For the current checkpoint and resume commands, see [HANDOFF.md](HANDOFF.md).
+For Daytona USA, see [DAYTONA.md](DAYTONA.md).
 
 The target is the original Astro City Mini: ARMv7 Cortex-A7, 256 MiB RAM,
 Mali-400/OpenGL ES 2.0, Linux 3.4.113. The native i960 code uses SLJIT's

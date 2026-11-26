@@ -2,6 +2,8 @@
 
 Checkpoint from November 20, 2026. Independent priority reviews now run every 4 hours, not every hour (user update, 2026-11-20).
 
+For Daytona USA, see the [current Daytona priorities](DAYTONA.md#current-priorities).
+
 ## Goal and current state
 
 Get the Virtua Fighter 2 recompilation running natively on the Astro City Mini. Build a new 3D engine abstraction if it is needed to reach the hardware target. The Mini already runs an interactive ARM build using its built-in controls and GLES rendering. The open performance goal is to sustain the arcade cadence of 57.53 Hz (17.384 ms per frame) with headroom in full-render combat at stock clocks. The user asked to defer audio until gameplay runs fast enough to test. Use combat frame times for optimization decisions and exclude arena entry, warmup, and capture.

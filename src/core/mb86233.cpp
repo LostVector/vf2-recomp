@@ -1556,6 +1556,11 @@ struct tgp_slice_options {
     bool reference_counts=std::getenv("VF2_TGP_COUNTER_REFERENCE")!=nullptr;
     bool native_jit=std::getenv("VF2_TGP_NATIVE_JIT")!=nullptr;
     bool packed_handlers=std::getenv("VF2_TGP_PACKED_HANDLERS")!=nullptr;
+#if defined(VF2_TGP_PROFILED_REGIONS)
+    bool profiled_regions=std::getenv("VF2_TGP_HOT_REGIONS")!=nullptr;
+#else
+    static constexpr bool profiled_regions=false;
+#endif
 #if defined(DAYTONA_TGP_COMMAND36_REGIONS)
     bool daytona_fused_dispatch=std::getenv("DAYTONA_TGP_FUSED_DISPATCH")!=nullptr;
     bool daytona_repeat_moves=std::getenv("DAYTONA_TGP_REPEAT_MOVES")!=nullptr;
@@ -1627,7 +1632,7 @@ void mb86233_device::execute_run_impl(const u32 *mapped, const uint64_t *mapped_
     // A previous slice validated this immutable mapped image and installed
     // the exact capabilities needed by the ordinary compiled-handler loop.
     // Any changed capability, pending continuation, or hook uses normal entry.
-    if(options.cached_entry&&program&&mapped&&mapped==m_checked_program&&m_block_program_matches&&
+    if(!options.profiled_regions&&options.cached_entry&&program&&mapped&&mapped==m_checked_program&&m_block_program_matches&&
        *mapped_revision&&*mapped_revision==m_checked_revision&&!on_instruction&&
        m_private_regions_allowed&&m_native_resume_allowed&&!m_pending_matrix.active){
         run_compiled_handlers();
@@ -1663,6 +1668,30 @@ void mb86233_device::execute_run_impl(const u32 *mapped, const uint64_t *mapped_
     }
     const compiled_block_entry *blocks=trusted&&!options.single&&!sample_pc?compiled_blocks():nullptr;
     if(trusted&&!blocks){
+#if defined(VF2_TGP_PROFILED_REGIONS)
+        if(options.profiled_regions&&m_private_regions_allowed&&!options.native_jit&&
+           !options.packed_handlers&&!options.reference_counts&&!g_tgp_command_samples){
+            static const auto profiled_program=[] {
+                std::array<compiled_entry,4096> table{};
+                std::copy_n(compiled_program(),table.size(),table.begin());
+                const auto install=[&]<u16 Pc,u32... Words>(){
+                    static_assert((private_instruction(Words)&&...));
+                    static_assert(((Words>>26<0x10||Words>>26>0x1f||private_register(Words>>24))&&...));
+                    constexpr compiled_entry expected[]={{Words,&compiled_instruction<Words>}...};
+                    if(std::equal(std::begin(expected),std::end(expected),table.begin()+Pc,
+                                  [](const compiled_entry &a,const compiled_entry &b){
+                                      return a.opcode==b.opcode&&a.run==b.run;
+                                  }))
+                        table[Pc].run=&private_region_entry<Pc,Words...>;
+                };
+#define VF2_PROFILED_REGION(pc,...) install.template operator()<pc,__VA_ARGS__>();
+                VF2_TGP_PROFILED_REGIONS(VF2_PROFILED_REGION)
+#undef VF2_PROFILED_REGION
+                return table;
+            }();
+            program=profiled_program.data();
+        }
+#endif
 #if defined(DAYTONA_TGP_COMMAND36_REGIONS)
         if(options.daytona_command36&&!sample_pc&&!options.native_jit&&!options.reference_counts&&
            !options.packed_handlers&&m_fast_ram.low&&m_fast_ram.high){

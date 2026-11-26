@@ -6166,6 +6166,20 @@ The VF2 runs that included the stack clipper and the texture binding
 cache changed both together, so they give no separate VF2 timing for
 either option.
 
+## Profiled VF2 DSP regions
+
+Set `VF2_TGP_HOT_REGIONS=1` to group 16 straight-line DSP spans
+identified during Shun combat. This requires a regenerated VF2 AOT
+table and a matching uploaded DSP program. The existing region guard
+preserves single-step execution when the slice is too short, repeat
+is active, or tracing or debugger callbacks are enabled.
+
+In a same-binary Shun replay at 1.200 GHz, median simulation CPU time
+fell from 18.142 to 17.520 ms and the grouped path removed 14.66 million
+individual dispatches across the replay. Game and geometry state
+matched and both runs had clean speaker audio. These results are from
+an untrained DSP build. The option is available for further testing.
+
 ## Opt-in VF2 detached audio
 
 Build the ARM VF2 frontend with `VF2_SCSP_ACCEL=1` to compile the

@@ -6214,3 +6214,18 @@ tested release settings are 160 ms and 95 ms respectively. A larger
 reserve costs playback latency. For a deterministic muted replay,
 `VF2_SOUND_PCM_HASH=1` reports a PCM digest and waits for each source
 tick to be processed without queue drops.
+
+For the detached VF2 board, `VF2_SOUND_FAST_RAM=1` uses direct 68000
+program and opcode RAM accesses with the same one-cycle wait and retry
+semantics. `VF2_SOUND_CYCLE_SAMPLE_INDEX=1` derives the SCSP sample
+index from the executing 68000 clock and retains the attosecond path
+for timer callbacks and unsupported times. Both options default off.
+Add `VF2_PROVE_SOUND_CYCLE_SAMPLE_INDEX=1` in a diagnostic run to
+compare the cycle-derived results with the reference conversion.
+
+The ARM timing fixture preserved 19,549 timed device accesses while
+bypassing 153,036 RAM callbacks. Fresh Shun training and the resulting
+profile-use build both produced the reference PCM digest, covering
+2,529,966 sample frames. The Dural speaker replay measured 9.306 to
+8.298 ms of synthesis per tick with the two options enabled. Neither
+arm reported an underrun, audio error, or dropped source tick.

@@ -86,6 +86,22 @@ for pc,word in enumerate(words):
         sequence = ','.join(f'0x{opcode:08x}u' for opcode in words[pc:private_regions[0xdca]])
         handler = f'private_4a_resume_entry<0x{pc:03x},{sequence}>'
     lines.append(f'    {{0x{word:08x}u,&{handler}}},')
+# Disjoint straight-line regions selected from sustained VF2 gameplay.
+# C++ checks their instruction forms before replacing an entry.
+if private_image:
+    profiled_regions = (
+        (0x1dd, 0x1e0), (0x1e3, 0x1e7), (0x260, 0x264), (0x4d3, 0x4df),
+        (0x913, 0x917), (0x91c, 0x921), (0x925, 0x92e), (0x932, 0x93e),
+        (0x95a, 0x95e), (0x963, 0x968), (0x970, 0x979), (0x981, 0x98c),
+        (0xa9d, 0xaa0), (0xaa1, 0xaa4), (0xaa5, 0xaae), (0xaaf, 0xab2),
+    )
+    continuation = ' ' + chr(92)
+    lines.append('#define VF2_TGP_PROFILED_REGIONS(REGION)' + continuation)
+    for index, (pc, end) in enumerate(profiled_regions):
+        sequence = ','.join(f'0x{opcode:08x}u' for opcode in words[pc:end])
+        suffix = continuation if index + 1 < len(profiled_regions) else ''
+        lines.append(f'    REGION(0x{pc:03x},{sequence})' + suffix)
+
 # Daytona command 0x36 has bus-visible setup and stores between the
 # private arithmetic spans. Keep both the exact image and the boundaries
 # explicit. The repeated external load keeps an ordinary read per step.

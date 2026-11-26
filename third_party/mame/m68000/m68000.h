@@ -45,6 +45,17 @@ public:
 	u32 reg(int n) const { return m_da[n]; }   // D0-D7, A0-A6, USP, SSP
 	// Only the verified Daytona sound board provides this private RAM.
 	void set_daytona_voice_ram(const u16 *ram) { m_daytona_voice_ram = ram; }
+#ifndef MODEL2_ORIGINAL
+    void set_vf2_sound_rom(const u8 *rom) { m_opcodes.sound_rom=m_program.sound_rom=rom; }
+    void set_vf2_sound_ram(u16 *ram, const void *tag)
+    {
+        for (space *memory : {&m_program, &m_opcodes}) {
+            memory->sound_ram = ram;
+            memory->sound_ram_tag = tag;
+            memory->sound_ram_cpu = this;
+        }
+    }
+#endif
 
 	virtual u32 execute_min_cycles() const noexcept override { return 1; }
 	virtual u32 execute_max_cycles() const noexcept override { return 158; }
@@ -65,8 +76,39 @@ protected:
 	{
 		m68000_bus *bus = nullptr;
 		int kind = m68000_bus::PROGRAM;
-		u16 read_interruptible(offs_t a, u16 mem_mask = 0xffff) { return bus->read(kind, a & 0xffffff, mem_mask); }
-		void write_interruptible(offs_t a, u16 data, u16 mem_mask = 0xffff) { bus->write(a & 0xffffff, data, mem_mask); }
+#ifndef MODEL2_ORIGINAL
+        const u8 *sound_rom=nullptr;
+        u16 *sound_ram=nullptr;
+        const void *sound_ram_tag=nullptr;
+        cpu_device *sound_ram_cpu=nullptr;
+#endif
+        u16 read_interruptible(offs_t a, u16 mem_mask = 0xffff)
+        {
+            a&=0xffffff;
+#ifndef MODEL2_ORIGINAL
+            const u32 offset=(a&~1u)-0x600000u;
+            if(offset<0x80000u&&sound_rom&&kind!=m68000_bus::CPU_SPACE)
+                return u16((unsigned(sound_rom[offset])<<8)|sound_rom[offset+1]);
+            if(a<0x80000u&&sound_ram){
+                if(sound_ram_cpu->access_before_delay(1,sound_ram_tag))return 0;
+                return sound_ram[a>>1];
+            }
+#endif
+            return bus->read(kind,a,mem_mask);
+        }
+		void write_interruptible(offs_t a, u16 data, u16 mem_mask = 0xffff)
+        {
+            a &= 0xffffff;
+#ifndef MODEL2_ORIGINAL
+            if(a<0x80000u&&sound_ram){
+                if(sound_ram_cpu->access_before_delay(1,sound_ram_tag))return;
+                u16 &word=sound_ram[a>>1];
+                word=u16((word & ~mem_mask) | (data & mem_mask));
+                return;
+            }
+#endif
+            bus->write(a,data,mem_mask);
+        }
 		u16 read_word(offs_t a) { return bus->peek(a & 0xffffff); }
 	};
 

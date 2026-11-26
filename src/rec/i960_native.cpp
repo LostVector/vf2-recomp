@@ -132,6 +132,7 @@ struct gen
     const bool lazy_pc_ok=std::getenv("VF2_REC_LAZY_PC")!=nullptr;
     bool lazy_pc_active=false;
     const bool scalar32=std::getenv("VF2_REC_SCALAR32")!=nullptr;
+    const bool native_cmpr=std::getenv("VF2_REC_NATIVE_CMPR")!=nullptr;
     const bool native_arithmetic=std::getenv("VF2_REC_NATIVE_ARITHMETIC")!=nullptr;
     const bool register_cycles=std::getenv("VF2_REC_REG_CYCLES")!=nullptr;
     const bool direct_branches=std::getenv("VF2_REC_DIRECT_BRANCHES")!=nullptr;
@@ -436,6 +437,46 @@ struct gen
             sljit_emit_fop1(C_,SLJIT_MOV_F64,target,0,SLJIT_MEM1(SLJIT_S0),o_fp+8*index);
         }else sljit_emit_fset64(C_,target,index==0x16?1.0:0.0);
     }
+    void floating_compare(uint32_t op){
+        ic_sub(10);
+        const bool narrow=scalar32&&!(op&0x1800);
+        if(narrow){
+            sljit_emit_fop1(C_,SLJIT_MOV_F32,SLJIT_FR0,0,SLJIT_MEM1(SLJIT_S0),reg(op&31));
+            sljit_emit_fop1(C_,SLJIT_MOV_F32,SLJIT_FR1,0,SLJIT_MEM1(SLJIT_S0),reg((op>>14)&31));
+        }else{
+            floating_source(SLJIT_FR0,op,false);
+            floating_source(SLJIT_FR1,op,true);
+        }
+        const auto precision=narrow?SLJIT_32:0;
+        auto *less=sljit_emit_fcmp(C_,SLJIT_ORDERED_LESS|precision,SLJIT_FR0,0,SLJIT_FR1,0);
+#if defined SLJIT_CONFIG_ARM_THUMB2 && SLJIT_CONFIG_ARM_THUMB2
+        // Thumb-2's VFP compare sets the same NZCV bits for all ordered
+        // conditions, so reuse the flags from the comparison above.
+        sljit_set_current_flags(C_,SLJIT_SET_ORDERED_EQUAL);
+        auto *equal=sljit_emit_jump(C_,SLJIT_ORDERED_EQUAL);
+        sljit_set_current_flags(C_,SLJIT_SET_ORDERED_GREATER);
+        auto *greater=sljit_emit_jump(C_,SLJIT_ORDERED_GREATER);
+#else
+        auto *equal=sljit_emit_fcmp(C_,SLJIT_ORDERED_EQUAL|precision,SLJIT_FR0,0,SLJIT_FR1,0);
+        auto *greater=sljit_emit_fcmp(C_,SLJIT_ORDERED_GREATER|precision,SLJIT_FR0,0,SLJIT_FR1,0);
+#endif
+        sljit_emit_op1(C_,SLJIT_MOV32,SLJIT_R3,0,SLJIT_IMM,0);
+        auto *unordered_done=sljit_emit_jump(C_,SLJIT_JUMP);
+        sljit_set_label(less,sljit_emit_label(C_));
+        sljit_emit_op1(C_,SLJIT_MOV32,SLJIT_R3,0,SLJIT_IMM,4);
+        auto *less_done=sljit_emit_jump(C_,SLJIT_JUMP);
+        sljit_set_label(equal,sljit_emit_label(C_));
+        sljit_emit_op1(C_,SLJIT_MOV32,SLJIT_R3,0,SLJIT_IMM,2);
+        auto *equal_done=sljit_emit_jump(C_,SLJIT_JUMP);
+        sljit_set_label(greater,sljit_emit_label(C_));
+        sljit_emit_op1(C_,SLJIT_MOV32,SLJIT_R3,0,SLJIT_IMM,1);
+        auto *done=sljit_emit_label(C_);
+        sljit_set_label(unordered_done,done);
+        sljit_set_label(less_done,done);
+        sljit_set_label(equal_done,done);
+        set_cc(SLJIT_R3);
+    }
+
     bool floating_arithmetic(const decoded &d){
         const auto op=d.op;const unsigned sub=(op>>7)&15,dst=(op>>19)&31;
         if(!native_arithmetic||(op&0x2000&&dst>=4))return false;
@@ -608,6 +649,10 @@ struct gen
 			}
 			return true;
 		}
+        case 0x68:
+            if(!native_cmpr||sub!=5)return false;
+            floating_compare(op);
+            return true;
         case 0x70: case 0x74:
             if(!native_arithmetic||sub!=1||lit_dst)return false;
             ic_sub(18);src1(SLJIT_R0,op);src2(SLJIT_R1,op);
@@ -730,7 +775,9 @@ struct gen
         // PCs unless they fall back to a helper. Commit before that helper,
         // on leaving compiled code, or in a cold cycle-budget exit stub.
         lazy_pc_active=lazy_pc_ok&&native_ok&&d.k==kind::normal&&
-            ((o>=0x20&&o<=0x27)||(o>=0x58&&o<=0x5f)||o==0x8c||(native_arithmetic&&(o==0x70||o==0x74||o==0x78)));
+            ((o>=0x20&&o<=0x27)||(o>=0x58&&o<=0x5f)||o==0x8c||
+             (native_cmpr&&o==0x68&&((d.op>>7)&15)==5)||
+             (native_arithmetic&&(o==0x70||o==0x74||o==0x78)));
         if(!lazy_pc_active)commit_pc(a,next);
 		const bool may_stall = o == 0x80 || o == 0x88 || o == 0x90 || o == 0x98 || o == 0x9a || o == 0xa0 || o == 0xa2 || o == 0xb0 || o == 0xb2 || o == 0xc0 || o == 0xc8 ||
 							   o == 0x60 || o == 0x66 || o == 0x0a;
@@ -825,7 +872,7 @@ struct gen
         timer_poll=rt.collapse_timer_poll&&rt.native_pc.empty()&&matches_timer_poll();
         if(timer_poll&&!spun.count(timer_poll_head))spun[timer_poll_head]=sljit_sw(spun.size()*sizeof(sljit_sw));
 		// entry(c, label): the spin loops' flags cleared, then straight to the instruction's code
-		sljit_emit_enter(C_, 0, SLJIT_ARGS2V(P, W), 4 | (native_arithmetic?SLJIT_ENTER_FLOAT(2):0), 2, sljit_s32(spun.size() * sizeof(sljit_sw)));
+		sljit_emit_enter(C_, 0, SLJIT_ARGS2V(P, W), 4 | ((native_arithmetic||native_cmpr)?SLJIT_ENTER_FLOAT(2):0), 2, sljit_s32(spun.size() * sizeof(sljit_sw)));
 		for (auto &[h, at] : spun) sljit_emit_op1(C_, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), at, SLJIT_IMM, 0);
         if(register_cycles){
             sljit_emit_op1(C_,SLJIT_MOV,SLJIT_R0,0,SLJIT_S1,0);

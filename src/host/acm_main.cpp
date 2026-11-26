@@ -91,7 +91,7 @@ class compositor {
 #ifdef MODEL2_ORIGINAL
     const bool static_canvas_enabled=std::getenv("DAYTONA_STATIC_COMPOSITE")!=nullptr;
 #else
-    static constexpr bool static_canvas_enabled=false;
+    const bool static_canvas_enabled=std::getenv("VF2_STATIC_COMPOSITE")!=nullptr;
 #endif
     bool static_canvas_active=false;
     uint64_t static_canvas_frames=0;
@@ -310,7 +310,14 @@ public:
         }
         const char *name=getenv("VF2_PCM");if(!name)name="default";
         int e=snd_pcm_open(&pcm,name,SND_PCM_STREAM_PLAYBACK,0);
-        if(e>=0)e=snd_pcm_set_params(pcm,SND_PCM_FORMAT_S16_LE,SND_PCM_ACCESS_RW_INTERLEAVED,2,44100,1,100000);
+        unsigned buffer_us=100000;
+#ifndef MODEL2_ORIGINAL
+        if(direct) {
+            if(const char *ms=std::getenv("VF2_SOUND_BUFFER_MS"))
+                buffer_us=1000u*std::clamp(std::atoi(ms),80,220);
+        }
+#endif
+        if(e>=0)e=snd_pcm_set_params(pcm,SND_PCM_FORMAT_S16_LE,SND_PCM_ACCESS_RW_INTERLEAVED,2,44100,1,buffer_us);
         if(e<0){std::fprintf(stderr,"ALSA: %s\n",snd_strerror(e));if(pcm)snd_pcm_close(pcm);pcm=nullptr;return false;}
         snd_pcm_hw_params_t *hp=nullptr;snd_pcm_hw_params_malloc(&hp);
         if(hp&&snd_pcm_hw_params_current(pcm,hp)>=0){
@@ -328,6 +335,23 @@ public:
         return true;
     }
     void set_direct(bool d){direct=d;}
+
+#ifndef MODEL2_ORIGINAL
+    // Keep a PCM reserve so a late video frame cannot starve ALSA
+    // while the board synthesizes the next block at the native sample rate.
+    std::chrono::microseconds time_until_refill()
+    {
+        snd_pcm_sframes_t delay=0;
+        if(snd_pcm_delay(pcm,&delay)<0)return {};
+        static const snd_pcm_sframes_t reserve=[] {
+            const char *value=std::getenv("VF2_SOUND_RESERVE_MS");
+            const int ms=value?std::clamp(std::atoi(value),30,120):40;
+            return snd_pcm_sframes_t(ms*441/10);
+        }();
+        if(delay<=reserve)return {};
+        return std::chrono::microseconds((delay-reserve)*1000000ll/44100);
+    }
+#endif
     // A synchronous write from the caller's thread: in detached mode that is
     // the sound worker, which owns the core the device is serviced on.
     void write_direct(const std::vector<int16_t> &block)
@@ -413,7 +437,8 @@ public:
     bool submit(const std::vector<model2a::timed_midi_byte> &events)
     {
         {
-            std::lock_guard lock(mutex);
+            std::unique_lock lock(mutex);
+            if (pcm_proof) room.wait(lock, [&] { return failed || closing || queue.size() < maximum_queue; });
             if (failed || closing) return false;
             // A playable run must not end because the worker fell behind for a
             // moment. The queue is bounded; on a stall drop the oldest tick
@@ -447,6 +472,12 @@ public:
             (unsigned long long)processed, (unsigned long long)midi_bytes, (unsigned long long)generated,
             (unsigned long long)speaker.submitted, (unsigned long long)speaker.underruns,
             (unsigned long long)speaker.errors, (unsigned long long)rejected);
+#ifndef MODEL2_ORIGINAL
+        if (run_ahead) std::fprintf(stderr, "Detached sound refill: %llu extra ticks\n",
+            (unsigned long long)refill_ticks);
+#endif
+        if(pcm_proof)std::fprintf(stderr,"Detached PCM proof: %016llx, %llu frames, %llu ticks\n",
+            (unsigned long long)pcm_hash,(unsigned long long)generated,(unsigned long long)processed);
         if (records.empty()) return;
         int64_t synth_total = 0, write_total = 0, synth_max = 0, write_max = 0;
         size_t queue_max = 0;
@@ -510,14 +541,27 @@ private:
             }
         }
         for (;;) {
-            task next;
+            task next{};
+            bool refill = false;
             {
                 std::unique_lock lock(mutex);
-                ready.wait(lock, [&] { return closing || failed || !queue.empty(); });
-                if (failed || queue.empty()) return;
-                next = std::move(queue.front());
-                queue.pop_front();
+                const auto has_work = [&] { return failed || closing || !queue.empty(); };
+#ifndef MODEL2_ORIGINAL
+                if (run_ahead && speaker.submitted && !speaker.errors && !has_work()) {
+                    lock.unlock();
+                    const auto wait = speaker.time_until_refill();
+                    lock.lock();
+                    refill = !ready.wait_for(lock, wait, has_work);
+                }
+#endif
+                if (!refill) {
+                    ready.wait(lock, has_work);
+                    if (failed || queue.empty()) return;
+                    next = std::move(queue.front());
+                    queue.pop_front();
+                }
             }
+            if (pcm_proof) room.notify_one();
             const bool starve = throttle_mod && (processed % throttle_mod) < throttle_skip;
             if (starve) ++starved;
             machine.set_throttle_68k(starve);
@@ -525,6 +569,7 @@ private:
             if (!machine.run_sound_frame(next.events)) {
                 std::lock_guard lock(mutex);
                 failed = true;
+                if (pcm_proof) room.notify_one();
                 std::fprintf(stderr, "Detached sound rejected MIDI at tick %llu\n", (unsigned long long)processed+1);
                 return;
             }
@@ -532,11 +577,19 @@ private:
             const uint64_t samples = machine.m_audio_out.size()/2;
             if (audible) speaker.write_direct(machine.m_audio_out);
             const auto written = clock::now();
+            if(pcm_proof)for(int16_t value:machine.m_audio_out){
+                const uint16_t sample=uint16_t(value);
+                pcm_hash=(pcm_hash^(sample&0xff))*1099511628211ull;
+                pcm_hash=(pcm_hash^(sample>>8))*1099511628211ull;
+            }
             machine.m_audio_out.clear();
             ++processed;
             midi_bytes += next.events.size();
             generated += samples;
-            if (trace) {
+#ifndef MODEL2_ORIGINAL
+            if (refill) ++refill_ticks;
+#endif
+            if (trace && !refill) {
                 const auto ns = [](auto span) { return std::chrono::duration_cast<std::chrono::nanoseconds>(span).count(); };
                 records.push_back({samples, speaker.submitted, speaker.underruns, speaker.errors,
                     next.events.size(), next.queued, ns(synthesized-begin), ns(written-synthesized)});
@@ -549,7 +602,13 @@ private:
     audio speaker;
     bool audible, trace;
     std::mutex mutex;
-    std::condition_variable ready;
+#ifndef MODEL2_ORIGINAL
+    const bool run_ahead = audible && std::getenv("VF2_SOUND_REFILL");
+    uint64_t refill_ticks = 0;
+#endif
+    std::condition_variable ready, room;
+    const bool pcm_proof = !audible && std::getenv("VF2_SOUND_PCM_HASH");
+    uint64_t pcm_hash = 14695981039346656037ull;
     std::deque<task> queue;
     bool failed = false, closing = false;
     uint64_t processed = 0, midi_bytes = 0, generated = 0, cycles_at_start = 0, pc_total = 0, rejected = 0, starved = 0;

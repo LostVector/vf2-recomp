@@ -9,10 +9,27 @@ case "$variant" in daytona-*) target=$variant;; esac
 flags='-std=c++20 -O3 -g1 -DNDEBUG -ffp-contract=off -Isrc/core/shim_include -Ibuild/acm/deps/include -ffunction-sections -fdata-sections'
 if [ "$variant" = vf2-acm-tgp-lto ]; then obj=$obj-lto;flags="$flags -flto=6";fi
 if [ "$variant" = vf2-acm-tgp-stats ]; then obj=$obj-stats;flags="$flags -DVF2_SCHED_DIAGNOSTICS=1";fi
+scsp_accel=0
+case "$variant" in
+    vf2-acm*)
+        if [ "${VF2_SCSP_ACCEL:-0}" = 1 ]; then
+            scsp_accel=1
+            obj=$obj-scsp
+            flags="$flags -DVF2_SCSP_ACCEL -Ibuild/gen"
+            if [ -f build/gen/vf2-scsp-native-steps.inc ]; then obj=$obj-native;fi
+            if [ "${VF2_SCSP_CAPTURE:-0}" = 1 ]; then
+                obj=$obj-capture
+                flags="$flags -DVF2_SCSP_LOCAL_PROGRAM"
+            fi
+        fi
+        ;;
+esac
 mkdir -p build/acm/bin
 arm-linux-gnueabihf-gcc -O2 -static -mcpu=cortex-a7 tools/acm/load-module.c -o build/acm/bin/load-module
 arm-linux-gnueabihf-gcc -O2 -static -pthread -mcpu=cortex-a7 tools/acm/usb-rpc.c -o build/acm/bin/usb-rpc
-make -j6 OBJ="$obj" BIN=build/acm/bin \
+# The same installed filename can be rebuilt from a different object set.
+rm -f "build/acm/bin/$variant"
+make -j6 OBJ="$obj" BIN=build/acm/bin VF2_SCSP_ACCEL="$scsp_accel" \
     CXX='arm-linux-gnueabihf-g++ -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard' \
     CXXFLAGS="$flags" \
     LDLIBS='build/acm/deps/lib/libz.a -static-libstdc++ -static-libgcc -pthread -latomic -Wl,--gc-sections -Wl,-rpath-link,/usr/arm-linux-gnueabihf/lib' \

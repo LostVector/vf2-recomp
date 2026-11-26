@@ -91,7 +91,7 @@ class compositor {
 #ifdef MODEL2_ORIGINAL
     const bool static_canvas_enabled=std::getenv("DAYTONA_STATIC_COMPOSITE")!=nullptr;
 #else
-    static constexpr bool static_canvas_enabled=false;
+    const bool static_canvas_enabled=std::getenv("VF2_STATIC_COMPOSITE")!=nullptr;
 #endif
     bool static_canvas_active=false;
     uint64_t static_canvas_frames=0;

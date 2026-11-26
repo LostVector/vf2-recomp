@@ -1629,6 +1629,42 @@ void mb86233_device::execute_run_impl(const u32 *mapped, const uint64_t *mapped_
             m_compiled_instructions+=instructions;
         }else run_direct_handlers(program);
     };
+#if defined(VF2_TGP_PROFILED_REGIONS)
+    const auto profiled_handlers=[]() -> const compiled_entry * {
+        static const auto profiled_program=[] {
+            std::array<compiled_entry,4096> table{};
+            std::copy_n(compiled_program(),table.size(),table.begin());
+            const auto install=[&]<u16 Pc,u32... Words>(){
+                static_assert((private_instruction(Words)&&...));
+                static_assert(((Words>>26<0x10||Words>>26>0x1f||private_register(Words>>24))&&...));
+                constexpr compiled_entry expected[]={{Words,&compiled_instruction<Words>}...};
+                if(std::equal(std::begin(expected),std::end(expected),table.begin()+Pc,
+                              [](const compiled_entry &a,const compiled_entry &b){
+                                  return a.opcode==b.opcode&&a.run==b.run;
+                              }))
+                    table[Pc].run=&private_region_entry<Pc,Words...>;
+            };
+#define VF2_PROFILED_REGION(pc,...) install.template operator()<pc,__VA_ARGS__>();
+            VF2_TGP_PROFILED_REGIONS(VF2_PROFILED_REGION)
+#undef VF2_PROFILED_REGION
+            return table;
+        }();
+        return profiled_program.data();
+    };
+    static const bool cache_profiled=std::getenv("VF2_TGP_CACHE_PROFILED_ENTRY")!=nullptr;
+    // A stable mapped image already selected these private handlers. A different
+    // program or pending continuation still enters normal validation.
+    if(cache_profiled&&options.profiled_regions&&options.cached_entry&&!options.packed_handlers&&
+#if defined(DAYTONA_TGP_COMMAND36_REGIONS)
+       !options.daytona_command36&&
+#endif
+       program&&mapped&&mapped==m_checked_program&&m_block_program_matches&&
+       *mapped_revision&&*mapped_revision==m_checked_revision&&!on_instruction&&
+       m_fast_ram_checked&&m_private_regions_allowed&&m_native_resume_allowed&&!m_pending_matrix.active){
+        run_direct_handlers(profiled_handlers());
+        return;
+    }
+#endif
     // A previous slice validated this immutable mapped image and installed
     // the exact capabilities needed by the ordinary compiled-handler loop.
     // Any changed capability, pending continuation, or hook uses normal entry.
@@ -1671,25 +1707,7 @@ void mb86233_device::execute_run_impl(const u32 *mapped, const uint64_t *mapped_
 #if defined(VF2_TGP_PROFILED_REGIONS)
         if(options.profiled_regions&&m_private_regions_allowed&&!options.native_jit&&
            !options.packed_handlers&&!options.reference_counts&&!g_tgp_command_samples){
-            static const auto profiled_program=[] {
-                std::array<compiled_entry,4096> table{};
-                std::copy_n(compiled_program(),table.size(),table.begin());
-                const auto install=[&]<u16 Pc,u32... Words>(){
-                    static_assert((private_instruction(Words)&&...));
-                    static_assert(((Words>>26<0x10||Words>>26>0x1f||private_register(Words>>24))&&...));
-                    constexpr compiled_entry expected[]={{Words,&compiled_instruction<Words>}...};
-                    if(std::equal(std::begin(expected),std::end(expected),table.begin()+Pc,
-                                  [](const compiled_entry &a,const compiled_entry &b){
-                                      return a.opcode==b.opcode&&a.run==b.run;
-                                  }))
-                        table[Pc].run=&private_region_entry<Pc,Words...>;
-                };
-#define VF2_PROFILED_REGION(pc,...) install.template operator()<pc,__VA_ARGS__>();
-                VF2_TGP_PROFILED_REGIONS(VF2_PROFILED_REGION)
-#undef VF2_PROFILED_REGION
-                return table;
-            }();
-            program=profiled_program.data();
+            program=profiled_handlers();
         }
 #endif
 #if defined(DAYTONA_TGP_COMMAND36_REGIONS)

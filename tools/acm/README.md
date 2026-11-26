@@ -6229,3 +6229,21 @@ profile-use build both produced the reference PCM digest, covering
 2,529,966 sample frames. The Dural speaker replay measured 9.306 to
 8.298 ms of synthesis per tick with the two options enabled. Neither
 arm reported an underrun, audio error, or dropped source tick.
+
+## Cached VF2 DSP handler entry
+
+Set `VF2_TGP_CACHED_ENTRY=1` together with
+`VF2_TGP_CACHE_PROFILED_ENTRY=1` to reuse the validated profiled DSP
+handler table on stable mapped slices. Programs with changed pointers
+or revisions, pending continuations, and debugger hooks use the regular
+entry checks. The option requires the profiled-region preset and remains
+off by default.
+
+On the Astro City Mini at 1.200 GHz and native 4x MSAA, this option
+reduced paired median simulation CPU by 0.192 ms on Dural and 0.186 ms
+on sustained Shun. Shun delivered p50/p95/p99 changed from
+18.137/19.850/21.144 to 17.951/19.627/20.980 ms. Both Shun replays
+matched game, geometry, compiled instruction and draw counts, and logged
+zero audio errors. A Cortex-A7 fixture exercised 393,216 slices with
+stable and changed program mappings and matched full CPU/RAM state and
+callback timing.

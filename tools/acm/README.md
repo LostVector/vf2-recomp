@@ -6144,3 +6144,22 @@ but the gain is on the 0.08 ms floor and the full replay does not
 reproduce it (-0.004 / -0.014 ms mean, p95 +0.171 / +0.082). It stays
 opt-in with the default off. Evidence:
 `build/acm/tex-mode/findings.md`.
+
+## Opt-in VF2 renderer experiments
+
+Each variable enables one experiment when present in the launch
+environment. Leave the variable unset for the default path.
+
+| Variable | Change |
+| --- | --- |
+| `VF2_STACK_FLAT_CLIP` | Clip flat polygons with three to eight vertices using fixed-size stack buffers. |
+| `VF2_CACHE_BATCH_TEXTURE_BINDS` | Reuse atlas bindings within the draw loop when a texture unit's page is unchanged. |
+| `VF2_FAST_FAN_CELL_COMPARE` | Use single-precision bounds for retained fans, with a double-precision check at rounded cell edges. Applies when `VF2_RETAINED_FAN_CELL_BOUNDS` is enabled. |
+
+In a historical Shun fight replay at 1.344 GHz, the texture-cell check
+reduced mean packet preparation from 10.215 to 9.780 ms. Repeating with
+phase profiling disabled held p50 at 18.444 ms and moved p99 from
+22.472 to 22.175 ms. Both repeat runs logged four audio underruns.
+The VF2 runs that included the stack clipper and the texture binding
+cache changed both together, so they give no separate VF2 timing for
+either option.

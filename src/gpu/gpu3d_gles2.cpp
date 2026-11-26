@@ -731,7 +731,11 @@ class gles2 final:public gpu3d {
             }
         };
 #ifdef MODEL2_ORIGINAL
-        static const bool stack_clipping = std::getenv("DAYTONA_STACK_FLAT_CLIP") != nullptr;
+        static const bool stack_clipping = std::getenv("DAYTONA_STACK_FLAT_CLIP") ||
+            std::getenv("VF2_STACK_FLAT_CLIP");
+#else
+        static const bool stack_clipping = std::getenv("VF2_STACK_FLAT_CLIP") != nullptr;
+#endif
         if (stack_clipping && p.n >= 3 && p.n <= 8) {
             std::array<vf2_tiles::point, 8> points;
             bool inside = true;
@@ -753,7 +757,6 @@ class gles2 final:public gpu3d {
             emit(polygon);
             return;
         }
-#endif
         std::vector<vf2_tiles::point> polygon;
         for (int i = 0; i < p.n; ++i)
             polygon.push_back(point_at(i));
@@ -1765,6 +1768,18 @@ class gles2 final:public gpu3d {
         trace_submit_phase("state-vertices",phase);
         if(trace_slow_submits)phase=std::chrono::steady_clock::now();
         unsigned uploaded_mesh_group=0;
+        static const bool cache_texture_bindings=std::getenv("VF2_CACHE_BATCH_TEXTURE_BINDS")!=nullptr;
+        const bool has_atlas=batch_atlas.page_count()!=0;
+        const unsigned unbound=std::numeric_limits<unsigned>::max();
+        unsigned page_a=unbound,page_b=unbound;
+        GLenum active_unit=GL_TEXTURE2;
+        const auto bind_page=[&](GLenum unit,unsigned &current,unsigned page){
+            if(cache_texture_bindings&&current==page)return;
+            if(!cache_texture_bindings||active_unit!=unit)glActiveTexture(unit);
+            glBindTexture(GL_TEXTURE_2D,batch_atlas.handle(page));
+            current=page;
+            active_unit=unit;
+        };
         for(size_t i=0;i<batch_draws.size();++i){
             const auto &draw=batch_draws[i];
             if(choose_modes){
@@ -1776,9 +1791,9 @@ class gles2 final:public gpu3d {
                 glUniform4fv(mesh_rows_location,192,mesh_rows[draw.mesh_group-1].data());
                 uploaded_mesh_group=draw.mesh_group;
             }
-            if(batch_atlas.page_count()){
-                glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,batch_atlas.handle(draw.page_a));
-                glActiveTexture(GL_TEXTURE1);glBindTexture(GL_TEXTURE_2D,batch_atlas.handle(draw.page_b));
+            if(has_atlas){
+                bind_page(GL_TEXTURE0,page_a,draw.page_a);
+                bind_page(GL_TEXTURE1,page_b,draw.page_b);
             }
             const auto draw_begin=trace_slow_submits?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
             if(frame_indexed)glDrawElements(GL_TRIANGLES,draw.count,GL_UNSIGNED_SHORT,reinterpret_cast<void*>((client_arrays?reinterpret_cast<uintptr_t>(batch_indices.data()):0)+draw.first*sizeof(uint16_t)));
@@ -1789,6 +1804,8 @@ class gles2 final:public gpu3d {
                 draw_call_indices+=draw.count;++draw_call_count;
             }
         }
+        if(cache_texture_bindings&&has_atlas&&!batch_draws.empty()&&active_unit!=GL_TEXTURE1)
+            glActiveTexture(GL_TEXTURE1);
         trace_submit_phase("draw-calls",phase);
         if(trace_slow_submits)phase=std::chrono::steady_clock::now();
         for(unsigned i=0;i<8;i++)glDisableVertexAttribArray(i);

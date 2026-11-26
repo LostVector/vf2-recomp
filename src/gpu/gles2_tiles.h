@@ -541,6 +541,16 @@ struct retained_fan {
     size_t index_count()const{return (n-2)*3;}
 };
 
+// A rounded edge preserves the sign of comparisons against any other
+// binary32 value. Only equality can conceal which side of the exact
+// binary64 edge the numerator lies on.
+inline bool fan_cell_contains(float numerator,float denominator,float base){
+    const float lower=base*denominator,upper=(base+1)*denominator;
+    return numerator>=lower&&numerator<=upper&&
+        (numerator!=lower||double(numerator)>=double(base)*denominator)&&
+        (numerator!=upper||double(numerator)<double(base+1)*denominator);
+}
+
 template<class Polygon>
 inline bool retain_fan(retained_fan &out,const Polygon &p,int max_level,
                        float x0,float y0,float x1,float y1,bool use_cell_index,bool use_cell_bounds=false,
@@ -572,6 +582,7 @@ inline bool retain_fan(retained_fan &out,const Polygon &p,int max_level,
         steps[0]=std::min(1.,128/(p.texw*s));steps[1]=std::min(1.,128/(p.texh*s));
     }
     int cell[2];
+    static const bool fast_cells=std::getenv("VF2_FAST_FAN_CELL_COMPARE")!=nullptr;
     if(fused_uv_bounds&&(!use_cell_bounds||micro)){
         if(!(steps[0]>0&&steps[1]>0))return false;
         double low[2]={INFINITY,INFINITY},high[2]={-INFINITY,-INFINITY};
@@ -610,8 +621,11 @@ inline bool retain_fan(retained_fan &out,const Polygon &p,int max_level,
             for(unsigned i=1;i<p.n;++i){
                 const auto &v=projected_point(p,i);
                 const float denominator=v.q*dim;
-                if(!(denominator>0&&denominator<INFINITY&&
-                     numerator(v)>=base*denominator&&numerator(v)<(base+1)*denominator))return false;
+                if(!(denominator>0&&denominator<INFINITY))return false;
+                const float value=numerator(v);
+                if(fast_cells){
+                    if(!fan_cell_contains(value,denominator,float(base)))return false;
+                }else if(!(value>=base*denominator&&value<(base+1)*denominator))return false;
             }
         }else{
             double lo=INFINITY,hi=-INFINITY;

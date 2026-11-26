@@ -3,6 +3,7 @@
 // From MAME's sound/scspdsp.cpp; the DSP reads and writes the sound RAM directly.
 #include "scspdsp.h"
 
+#include <cstdlib>
 #include <cstring>
 
 
@@ -69,8 +70,19 @@ void SCSPDSP::Init()
 	Stopped = true;
 }
 
+#ifdef VF2_SCSP_ACCEL
+void vf2_scsp_decoded_step(SCSPDSP &dsp);
+#endif
+
 void SCSPDSP::Step()
 {
+#ifdef VF2_SCSP_ACCEL
+    static const bool use_decoded = std::getenv("VF2_SCSP_DECODED") != nullptr;
+    if (use_decoded) {
+        vf2_scsp_decoded_step(*this);
+        return;
+    }
+#endif
 	if (Stopped)
 		return;
 

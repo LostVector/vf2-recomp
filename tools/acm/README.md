@@ -6164,3 +6164,27 @@ phase profiling disabled held p50 at 18.444 ms and moved p99 from
 The VF2 runs that included the stack clipper and the texture binding
 cache changed both together, so they give no separate VF2 timing for
 either option.
+
+## Opt-in VF2 detached audio
+
+Build the ARM VF2 frontend with `VF2_SCSP_ACCEL=1` to compile the
+decoded effects DSP. Launch with `VF2_SCSP_DECODED=1` to use it.
+`VF2_SOUND_FAST_ROM=1` also enables the direct 68000 ROM read path
+for the detached board.
+
+To build the optional specialized effects program, build once with
+`VF2_SCSP_ACCEL=1 VF2_SCSP_CAPTURE=1` and play a VF2 fight with
+`VF2_SCSP_DECODED=1`. Run
+`python tools/acm/generate-scsp-native.py <capture-log>` and rebuild
+with `VF2_SCSP_ACCEL=1`. Set `VF2_SCSP_NATIVE=1` alongside
+`VF2_SCSP_DECODED=1` to use the specialization. The runtime verifies the
+complete program and uses decoded execution if it differs. Keep the
+generated include and captured program local.
+
+The detached speaker worker can build a reserve with
+`VF2_SOUND_REFILL=1`. `VF2_SOUND_BUFFER_MS` and
+`VF2_SOUND_RESERVE_MS` set the ALSA buffer and refill threshold. The
+tested release settings are 160 ms and 95 ms respectively. A larger
+reserve costs playback latency. For a deterministic muted replay,
+`VF2_SOUND_PCM_HASH=1` reports a PCM digest and waits for each source
+tick to be processed without queue drops.

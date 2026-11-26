@@ -4568,6 +4568,9 @@ void model2a::sound_reset()
 	// the 68000: power-on and reset (it reads its vectors when it first runs)
 	m_snd_bus = std::make_unique<snd_bus>(*this);
 	m_68k = std::make_unique<m68000_device>(*m_snd_bus, 45158400 / 4);
+    const auto &sound_rom=m_roms.regions[romset::AUDIOCPU];
+    if(m_sound_only&&sound_rom.size()==0x80000&&std::getenv("VF2_SOUND_FAST_ROM"))
+        m_68k->set_vf2_sound_rom(sound_rom.data());
 	m_68k->start();
 	m_68k->reset();
 #endif

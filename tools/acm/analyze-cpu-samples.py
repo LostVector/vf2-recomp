@@ -59,7 +59,7 @@ for pc,n in counts.items():
     for lo,hi,offset,perms,path in maps:
         if lo<=pc<hi:
             module=path;name=path
-            if path.endswith('/vf2-acm'):
+            if pathlib.PurePosixPath(path).name in ('vf2-acm','daytona-acm'):
                 address=pc-lo+offset;at=bisect.bisect_right(starts,address)-1
                 if at>=0:name=symbols[at][1]
             elif path in module_symbols:

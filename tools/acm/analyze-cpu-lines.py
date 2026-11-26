@@ -30,7 +30,7 @@ for pc, n in (line.split() for line in a.samples.read_text().splitlines()):
 maps = []
 for line in (a.maps or pathlib.Path(str(a.samples) + '.maps')).read_text().splitlines():
     fields = line.split(maxsplit=5)
-    if len(fields) < 6 or not fields[5].endswith('/vf2-acm'):
+    if len(fields) < 6 or pathlib.PurePosixPath(fields[5]).name not in ('vf2-acm', 'daytona-acm'):
         continue
     lo, hi = (int(x, 16) for x in fields[0].split('-'))
     maps.append((lo, hi, int(fields[2], 16)))

@@ -1,6 +1,6 @@
 # Astro City Mini VF2 handoff
 
-Current VF2 checkpoint from November 26, 2026. The sections below it retain the November 20 baseline and earlier experiment history.
+Current VF2 checkpoint from November 27, 2026. The sections below it retain the November 20 baseline and earlier experiment history.
 
 For Daytona USA, see the [current Daytona priorities](DAYTONA.md#current-priorities).
 
@@ -19,7 +19,14 @@ for that candidate. The later linked-register and shared cell-split
 prototypes did not show a repeatable improvement. Atlas capacity helped
 attract mode when the cap rose from 16 to 32 MiB. In the 18,000-tick
 attract replay both 32 and 128 MiB used the same eight pages and had zero
-capacity fallbacks. Continue using 32 MiB for attract comparisons.
+capacity fallbacks. Longer interactive runs at 32 MiB hit kernel OOM when
+ordinary free RAM dropped to about 2 MiB. A 24,000-frame diagnostic showed
+the atlas retaining nine pages, with 48 MiB of total Mali allocations.
+Use a 16 MiB cap for the interactive preset. Before raising it, measure
+total Mali allocations and peak pressure outside the CMA pool over a full
+attract cycle that includes the later scenes. The atlas cap covers its
+texture backing bytes. Render targets, draw buffers and other driver
+allocations also need headroom.
 
 1. Use the sustained Shun traces to distinguish CPU-heavy ticks from
    renderer waits. Measure cycle and call distributions across whole DSP

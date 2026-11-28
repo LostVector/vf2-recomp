@@ -209,7 +209,9 @@ public:
         set(2,8,active(KEY_B)||active(KEY_Y)||active(KEY_DOWN));
         for(int gear=0;gear<=4;++gear)set(3,1<<gear,active(gear?KEY_1+gear-1:KEY_0));
 #else
-        set(1,1,active(KEY_A)||active(KEY_X));set(1,2,active(KEY_B)||active(KEY_Y));set(1,4,active(KEY_C)||active(KEY_Z));
+        set(1,4,active(KEY_A)||active(KEY_X)); // Guard
+        set(1,1,active(KEY_B)||active(KEY_Y)); // Punch
+        set(1,2,active(KEY_C)||active(KEY_Z)); // Kick
         set(1,0x10,active(KEY_DOWN));set(1,0x20,active(KEY_UP));set(1,0x40,active(KEY_RIGHT));set(1,0x80,active(KEY_LEFT));
 #endif
         if(active(KEY_ESC)||active(KEY_POWER))stopping=1;

@@ -4547,17 +4547,47 @@ void model2a::sound_reset()
 		if (delay == scsp_device::NEVER) timer_disable(T_SCSP0 + t);
 		else timer_adjust(T_SCSP0 + t, delay, 0, period);
 	};
-	h.sample_index = [this] {   // sound_stream::get_current_sample_index
-		// floor(t * 44100 / 10^18), as the whole seconds and the rest: 10^18 is 2^18 5^18, and
-		// dividing by 2^18 (a shift) and then by 5^18 gives the same quotient, in 64 bits
-		const atime t = time();
-		constexpr uint64_t FIVE18 = 3814697265625ull;
-		if (t >> 82) return uint64_t(t / AS_PER_SEC) * SOUND_RATE + uint64_t((t % AS_PER_SEC) * SOUND_RATE / AS_PER_SEC);
-		const uint64_t secs = uint64_t(t >> 18) / FIVE18;
-		const atime rest = t - atime(secs) * AS_PER_SEC;
-		return secs * SOUND_RATE + uint64_t(rest * SOUND_RATE >> 18) / FIVE18;
-	};
-	h.time_is_zero = [this] { return time() == 0; };
+	const bool cycle_index = m_sound_only && std::getenv("VF2_SOUND_CYCLE_SAMPLE_INDEX");
+    const bool prove_cycle_index = std::getenv("VF2_PROVE_SOUND_CYCLE_SAMPLE_INDEX") != nullptr;
+    if(cycle_index)std::fprintf(stderr,"SCSP: cycle-derived sample index%s\n",
+                               prove_cycle_index?" with reference comparison":"");
+    const auto index_at_time = [](atime t) {
+        constexpr uint64_t FIVE18 = 3814697265625ull;
+        if (t >> 82)
+            return uint64_t(t / AS_PER_SEC) * SOUND_RATE + uint64_t((t % AS_PER_SEC) * SOUND_RATE / AS_PER_SEC);
+        const uint64_t secs = uint64_t(t >> 18) / FIVE18;
+        const atime rest = t - atime(secs) * AS_PER_SEC;
+        return secs * SOUND_RATE + uint64_t(rest * SOUND_RATE >> 18) / FIVE18;
+    };
+    h.sample_index = [this,cycle_index,prove_cycle_index,index_at_time] {
+        static_assert(SOUND_CPU_CLOCK == 256*SOUND_RATE);
+        constexpr uint64_t remainder = uint64_t(AS_PER_SEC % SOUND_CPU_CLOCK);
+        static_assert(remainder != 0);
+        constexpr uint64_t exact_cycles = uint64_t((AS_PER_SEC-1) / remainder);
+        if(cycle_index&&!m_in_callback&&m_executing==CPU_68K){
+            const auto cycles = snd_cycles();
+            if(cycles <= exact_cycles){
+                // At every positive cycle the floored period is early.
+                // It is less than one CPU cycle early within this bound.
+                const uint64_t index = cycles ? (cycles-1)/256 : 0;
+                if(prove_cycle_index&&index!=index_at_time(time())){
+                    std::fprintf(stderr,"SCSP sample index mismatch at CPU cycle %llu\n",
+                                 (unsigned long long)cycles);
+                    std::abort();
+                }
+                return index;
+            }
+        }
+        return index_at_time(time());
+    };
+    h.time_is_zero = [this,cycle_index,prove_cycle_index] {
+        if(cycle_index&&!m_in_callback&&m_executing==CPU_68K){
+            const bool zero = snd_cycles()==0;
+            if(prove_cycle_index&&zero!=(time()==0))std::abort();
+            return zero;
+        }
+        return time()==0;
+    };
 	m_scsp = std::make_unique<scsp_device>(45158400 / 2, m_soundram.data(), u32(m_soundram.size() * 2), h);
 	for (int g = 0; g < 2; g++) m_scsp->set_group_gain(g, m_volume[g]);
 	m_audio_out.clear();
@@ -4568,6 +4598,11 @@ void model2a::sound_reset()
 	// the 68000: power-on and reset (it reads its vectors when it first runs)
 	m_snd_bus = std::make_unique<snd_bus>(*this);
 	m_68k = std::make_unique<m68000_device>(*m_snd_bus, 45158400 / 4);
+    const auto &sound_rom=m_roms.regions[romset::AUDIOCPU];
+    if(m_sound_only&&sound_rom.size()==0x80000&&std::getenv("VF2_SOUND_FAST_ROM"))
+        m_68k->set_vf2_sound_rom(sound_rom.data());
+    if(m_sound_only&&std::getenv("VF2_SOUND_FAST_RAM"))
+        m_68k->set_vf2_sound_ram(m_soundram.data(),&m_snd_bus->ram_tag);
 	m_68k->start();
 	m_68k->reset();
 #endif

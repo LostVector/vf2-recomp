@@ -309,7 +309,9 @@ public:
         unsigned index=0;
         // A 520 page holds four bordered 256 tiles. Smaller coordinates retain
         // substantially more interpolation precision than a 2048 atlas.
-        unsigned side=520;while(side<w+2||side<h+2)side=side*2-8;
+        static const bool large_pages=std::getenv("VF2_ATLAS_LARGE_PAGES")!=nullptr;
+        unsigned side=large_pages?1032:520;
+        while(side<w+2||side<h+2)side=side*2-8;
         for(;index<pages.size();index++){
             auto &p=pages[index];if(p.side!=side||p.repeat)continue;
             for(auto &s:p.shelves)if(s.height==h+2&&s.x+w+2<=side){row=&s;break;}
